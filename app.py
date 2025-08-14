@@ -1,8 +1,9 @@
 """
 India District Poverty Mapping — Single-file Streamlit App
-(folium + ultra-robust NumPy export: geemap -> bandwise sampleRectangle -> toArray().neighborhoodToArray())
+(folium + ultra-robust NumPy export: geemap -> bandwise sampleRectangle ->
+ toArray().neighborhoodToArray() with dynamic property detection & array unpacking)
 
-Env / Secrets required:
+Environment / Secrets required in your deployment:
   - GCP_SA_KEY      : base64(key.json) or full JSON (one line / triple-quoted)
   - GEE_PROJECT_ID  : your Cloud project that has Earth Engine enabled
 """
@@ -30,18 +31,31 @@ except Exception:
     except Exception:
         pass
 
+# --- geemap (graceful install, used for ee_to_numpy helper) ---
+try:
+    import geemap
+except Exception:
+    try:
+        import sys, subprocess
+        subprocess.check_call([sys.executable, "-m", "pip", "install", "geemap"])
+        import geemap
+    except Exception:
+        st.error("Failed to import or install `geemap`. Please add it to your requirements.")
+        st.stop()
+
 import folium
 import ee
-import geemap
 
 import tensorflow as tf
 from tensorflow.keras import layers, models
 from sklearn.metrics import precision_score, recall_score, f1_score, accuracy_score
 
+
 # ---------- UI ----------
 st.set_page_config(page_title="India Poverty Mapping — GEE + DL", page_icon="🗺️", layout="wide")
 st.title("🗺️ India District Poverty Mapping — GEE + CNN / U-Net / Hybrid")
 st.caption("Click any district in India to fetch features from GEE and train three models on a local patch.")
+
 
 # ---------- Auth helpers ----------
 def _read_sa_json_from_secret(var="GCP_SA_KEY") -> dict:
@@ -61,6 +75,7 @@ def _read_sa_json_from_secret(var="GCP_SA_KEY") -> dict:
         raw = raw.decode("utf-8", errors="ignore")
     s = str(raw).strip()
 
+    # If it already looks like JSON, try to fix private_key newlines if needed
     if s.startswith("{") and s.endswith("}"):
         try:
             return json.loads(s)
@@ -77,6 +92,7 @@ def _read_sa_json_from_secret(var="GCP_SA_KEY") -> dict:
                 pass
             return json.loads(s.replace("\\n", "\n"))
 
+    # Else try base64 decode
     try:
         decoded = base64.b64decode(s, validate=False).decode("utf-8", errors="ignore").strip()
         if decoded.startswith("{") and decoded.endswith("}"):
@@ -84,6 +100,7 @@ def _read_sa_json_from_secret(var="GCP_SA_KEY") -> dict:
     except Exception:
         pass
     return json.loads(s.replace("\\n", "\n"))
+
 
 def ee_init_from_secret():
     key_info = _read_sa_json_from_secret()
@@ -115,10 +132,12 @@ def ee_init_from_secret():
         )
         st.stop()
 
+
 try:
     ee.Number(1).getInfo()
 except Exception:
     ee_init_from_secret()
+
 
 # ---------- Map helpers ----------
 def add_ee_image_to_folium(m: folium.Map, ee_image: ee.Image, vis_params: dict, name: str):
@@ -130,6 +149,7 @@ def add_ee_image_to_folium(m: folium.Map, ee_image: ee.Image, vis_params: dict, 
         overlay=True,
         control=True,
     ).add_to(m)
+
 
 # --- Robust exporters --------------------------------------------------------
 def ee_to_numpy_robust(image: ee.Image, region: ee.Geometry, base_scale: int, crs: str) -> np.ndarray:
@@ -162,42 +182,119 @@ def ee_to_numpy_robust(image: ee.Image, region: ee.Geometry, base_scale: int, cr
     except Exception as e2:
         raise RuntimeError(f"Failed to convert EE image to numpy. Last error: {last_err}\nFallback error: {e2}")
 
-def ee_patch_neighborhood(image: ee.Image, point: ee.Geometry.Point, size_km: float, scale: int, crs: str) -> np.ndarray:
-    """
-    Third fallback (FIXED): sample a patch using toArray().neighborhoodToArray() around the point.
-    This bypasses rectangular region/tiling issues for stubborn districts.
-    """
-    size_px = max(8, int(round((size_km * 1000.0) / float(scale))))
-    size_px = min(size_px, 256)
-    radius = max(1, size_px // 2)
 
+def ee_patch_neighborhood(image: ee.Image,
+                          point: ee.Geometry.Point,
+                          size_km: float,
+                          scale: int,
+                          crs: str) -> np.ndarray:
+    """
+    Ultra-robust neighborhood extractor around a point.
+    Handles arbitrary property names, nested/object arrays, and reduces patch size if needed.
+    Returns a (rows, cols, bands) float32 array.
+    """
+    # Base pixels across for the requested size/scale
+    base_px = max(8, int(round((size_km * 1000.0) / float(scale))))
+    # Try progressively smaller neighborhoods if needed
+    px_candidates = [base_px, int(base_px*0.75), int(base_px*0.5), int(base_px*0.33), 24, 16, 12]
+    # Also try slightly coarser scales in case of compute/memory limits
+    scale_candidates = [scale, int(scale*1.5), int(scale*2)]
+
+    last_err = None
     bands = image.bandNames().getInfo()
+    nbands = len(bands)
 
-    # ----- CRITICAL FIX: use toArray().neighborhoodToArray() -----
-    arr_img = (
-        image.unmask(0)            # fill nodata
-             .toArray()            # stack bands -> 1D array along band axis
-             .reproject(crs=crs, scale=scale)
-             .neighborhoodToArray(ee.Kernel.square(radius, 'pixels', True))
-    )
+    for sc in scale_candidates:
+        for px in px_candidates:
+            try:
+                radius = max(1, px // 2)
 
-    feat = arr_img.sample(point, scale=scale, numPixels=1, geometries=False).first()
-    if feat is None:
-        raise RuntimeError("Neighborhood sample returned None.")
+                arr_img = (
+                    image.unmask(0)             # fill nodata
+                         .toArray()             # stack bands along array axis
+                         .reproject(crs=crs, scale=sc)
+                         .neighborhoodToArray(ee.Kernel.square(radius, 'pixels', True))
+                )
 
-    data = feat.get('array').getInfo()   # property name is 'array' after toArray()
-    arr = np.array(data, dtype=np.float32)
+                feat = arr_img.sample(point, scale=sc, numPixels=1, geometries=False).first()
+                if feat is None:
+                    last_err = RuntimeError("Neighborhood sample returned None.")
+                    continue
 
-    # Expected shape: [bands, rows, cols]; make [rows, cols, bands]
-    if arr.ndim != 3:
-        raise RuntimeError(f"Neighborhood array has unexpected shape: {arr.shape}")
-    if arr.shape[0] == len(bands):
-        arr = np.transpose(arr, (1, 2, 0))
-    elif arr.shape[-1] == len(bands):
-        pass
-    else:
-        raise RuntimeError(f"Neighborhood array band dimension mismatch: {arr.shape} vs {len(bands)}")
-    return arr
+                # Get *all* properties and pick the first that looks like a nested list/array
+                props = ee.Feature(feat).toDictionary().getInfo()
+                key = None
+                for k, v in props.items():
+                    if isinstance(v, list):
+                        key = k
+                        break
+                if key is None:
+                    raise RuntimeError(f"No array-like property found in neighborhood sample. Props: {list(props.keys())}")
+
+                raw = props[key]
+
+                # Convert to numpy. If it becomes an object array, unpack into a numeric cube.
+                arr = np.array(raw, dtype=object)
+                if arr.dtype == object:
+                    # Expect a 2-D grid where each cell is a [bands] list
+                    H = len(arr)
+                    W = len(arr[0]) if H > 0 else 0
+                    if H == 0 or W == 0:
+                        raise RuntimeError(f"Neighborhood object array empty: shape={arr.shape}")
+                    # Determine bands len from first pixel
+                    try:
+                        b0 = len(arr[0][0])
+                    except Exception:
+                        raise RuntimeError("Neighborhood object array cells are not band vectors.")
+                    if b0 != nbands:
+                        # Sometimes the array comes as [bands, rows, cols] wrapped at one axis
+                        # Try to coerce via np.array with float dtype directly
+                        arr_num = np.array(raw, dtype=np.float32)
+                        if arr_num.ndim == 3:
+                            if arr_num.shape[0] == nbands:
+                                arr_num = np.transpose(arr_num, (1, 2, 0))
+                            elif arr_num.shape[-1] != nbands:
+                                raise RuntimeError(f"Unexpected numeric array shape {arr_num.shape} for {nbands} bands")
+                        elif arr_num.ndim == 4 and 1 in arr_num.shape:
+                            arr_num = np.squeeze(arr_num)
+                            if arr_num.ndim != 3:
+                                raise RuntimeError(f"Squeezed array has wrong ndim: {arr_num.ndim}")
+                            if arr_num.shape[0] == nbands:
+                                arr_num = np.transpose(arr_num, (1, 2, 0))
+                        arr = arr_num
+                    else:
+                        # Build (H, W, nbands)
+                        out = np.zeros((H, W, nbands), dtype=np.float32)
+                        for i in range(H):
+                            row = arr[i]
+                            for j in range(W):
+                                out[i, j, :] = np.array(row[j], dtype=np.float32)
+                        arr = out
+                else:
+                    # Numeric array already; normalize axis order
+                    arr = arr.astype(np.float32)
+                    if arr.ndim == 4 and 1 in arr.shape:
+                        arr = np.squeeze(arr)
+                    if arr.ndim == 3:
+                        if arr.shape[0] == nbands:       # [bands, rows, cols] -> [rows, cols, bands]
+                            arr = np.transpose(arr, (1, 2, 0))
+                        elif arr.shape[-1] != nbands and arr.shape[1] == nbands:
+                            # [rows, bands, cols] -> [rows, cols, bands]
+                            arr = np.transpose(arr, (0, 2, 1))
+                    else:
+                        raise RuntimeError(f"Neighborhood numeric array has unexpected shape: {arr.shape}")
+
+                if arr.ndim != 3 or arr.shape[-1] != nbands:
+                    raise RuntimeError(f"Final neighborhood array shape {arr.shape} does not match bands={nbands}")
+
+                return arr  # (rows, cols, bands)
+
+            except Exception as e:
+                last_err = e
+                continue
+
+    raise RuntimeError(f"Neighborhood array export failed; last error: {last_err}")
+
 
 # ---------- GEE Processor ----------
 class GEEProcessor:
@@ -340,15 +437,18 @@ class GEEProcessor:
         except Exception:
             return None
 
-    def numpy_patch_from_point(
-        self, lat: float, lon: float, size_km: float = 12, scale: int = 100, num_classes: int = 3
-    ) -> Tuple[np.ndarray, np.ndarray]:
+    # ---- SUPER ROBUST PATCH EXPORT (includes neighborhood fallback) ----
+    def numpy_patch_from_point(self,
+                               lat: float,
+                               lon: float,
+                               size_km: float = 12,
+                               scale: int = 100,
+                               num_classes: int = 3) -> Tuple[np.ndarray, np.ndarray]:
         """
         Build region, then try:
           - geemap.ee_to_numpy (scale, 2×, 4×)
           - band-wise sampleRectangle
-          - toArray().neighborhoodToArray()   <-- FIXED & most robust
-        Also retries with smaller region sizes.
+          - toArray().neighborhoodToArray() with size/scale backoffs (super robust)
         """
         pt = ee.Geometry.Point([lon, lat])
 
@@ -357,41 +457,39 @@ class GEEProcessor:
             raise RuntimeError("Feature stack not ready")
 
         last_error = None
+        # Region-based tries (fast when it works)
         for km_factor in [1.0, 0.75, 0.5]:
             size_try = size_km * km_factor
             region = pt.buffer(size_try * 1000 / 2.0).bounds().intersection(self.study_area, maxError=1)
-            # robust export
             try:
-                # try standard & band-wise first
                 X = ee_to_numpy_robust(stack, region=region, base_scale=scale, crs='EPSG:4326')
-            except Exception as e1:
-                # final fallback: toArray().neighborhoodToArray around the point
-                try:
-                    X = ee_patch_neighborhood(stack, pt, size_try, scale, 'EPSG:4326')
-                except Exception as e2:
-                    last_error = (e1, e2)
-                    continue
-
-            X = np.nan_to_num(np.array(X, dtype=np.float32), nan=0.0)
-
-            # label via same export path
-            try:
+                X = np.nan_to_num(np.array(X, dtype=np.float32), nan=0.0)
+                # Label through same path
                 y_img = self.features['Poverty_Index']
-                try:
-                    pov = ee_to_numpy_robust(y_img, region=region, base_scale=scale, crs='EPSG:4326')
-                except Exception:
-                    pov = ee_patch_neighborhood(y_img, pt, size_try, scale, 'EPSG:4326')
-            except Exception as e3:
-                last_error = e3
-                continue
+                pov = ee_to_numpy_robust(y_img, region=region, base_scale=scale, crs='EPSG:4326')
+                yf = np.nan_to_num(np.array(pov, dtype=np.float32), nan=0.0).squeeze()
+                flat = yf.flatten()
+                qs = np.quantile(flat[~np.isnan(flat)], np.linspace(0, 1, num_classes + 1))
+                y = np.digitize(yf, qs[1:-1], right=False).astype(np.int32)
+                return X, y
+            except Exception as e:
+                last_error = e
+                # fall through to neighborhood fallback
 
+        # Neighborhood fallback (point kernel) — very resilient
+        try:
+            X = ee_patch_neighborhood(stack, pt, size_km=size_km, scale=scale, crs='EPSG:4326')
+            y_img = self.features['Poverty_Index']
+            pov = ee_patch_neighborhood(y_img, pt, size_km=size_km, scale=scale, crs='EPSG:4326')
             yf = np.nan_to_num(np.array(pov, dtype=np.float32), nan=0.0).squeeze()
             flat = yf.flatten()
             qs = np.quantile(flat[~np.isnan(flat)], np.linspace(0, 1, num_classes + 1))
             y = np.digitize(yf, qs[1:-1], right=False).astype(np.int32)
-            return X, y
+            return np.nan_to_num(X, nan=0.0), y
+        except Exception as e2:
+            last_error = (last_error, e2)
+            raise RuntimeError(f"Patch export failed even after retries: {last_error}")
 
-        raise RuntimeError(f"Patch export failed even after retries: {last_error}")
 
 # ---------- Models ----------
 def conv_block(x, f):
@@ -469,6 +567,7 @@ def compute_metrics(y_true, y_pred, num_classes):
     f1   = f1_score(yt, yp, average="macro", zero_division=0)
     return acc, prec, rec, f1
 
+
 # ---------- Sidebar ----------
 with st.sidebar:
     st.header("⚙️ Settings")
@@ -479,6 +578,7 @@ with st.sidebar:
     batch_size  = st.selectbox("Batch size", [2, 4, 8, 16], index=2)
     size_km     = st.slider("Patch span around click (km)", 6, 30, 12)
     st.info("Click a district on the map to run the pipeline.")
+
 
 # ---------- Map ----------
 clicked = None
@@ -508,6 +608,7 @@ else:
     if st.button("Use these coordinates"):
         clicked = (float(lat_in), float(lon_in))
 
+
 # ---------- Patching / training helpers ----------
 def make_patches(X, Y, size, stride):
     H, W, C = X.shape
@@ -522,12 +623,14 @@ def make_patches(X, Y, size, stride):
         return np.empty((0,size,size,X.shape[2]), dtype=np.float32), np.empty((0,size,size), dtype=np.int32)
     return np.stack(xs).astype(np.float32), np.stack(ys).astype(np.int32)
 
+
 def train_and_eval(model_fn, Xtr, Ytr, Xte, Yte, epochs, batch_size, num_classes):
     model = model_fn(Xtr.shape[1:], num_classes)
     model.compile(optimizer="adam", loss="sparse_categorical_crossentropy", metrics=["accuracy"])
     model.fit(Xtr, Ytr, epochs=epochs, batch_size=batch_size, verbose=0)
     Yhat = np.argmax(model.predict(Xte, verbose=0), axis=-1)
     return compute_metrics(Yte, Yhat, num_classes), Yhat
+
 
 # ---------- Pipeline ----------
 if clicked:
