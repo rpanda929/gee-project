@@ -1,6 +1,6 @@
 """
 India District Poverty Mapping — Single-file Streamlit App
-(folium + robust NumPy export + strict EE project init)
+(folium + ultra-robust NumPy export: geemap -> bandwise sampleRectangle -> neighborhoodToArray)
 
 Env / Secrets required:
   - GCP_SA_KEY      : base64(key.json) or full JSON (one line / triple-quoted)
@@ -15,8 +15,6 @@ import numpy as np
 import pandas as pd
 import streamlit as st
 import plotly.express as px
-import matplotlib.pyplot as plt
-import seaborn as sns
 
 # --- streamlit-folium (graceful install) ---
 HAVE_ST_FOLIUM = True
@@ -42,12 +40,6 @@ from sklearn.metrics import precision_score, recall_score, f1_score, accuracy_sc
 
 # ---------- UI ----------
 st.set_page_config(page_title="India Poverty Mapping — GEE + DL", page_icon="🗺️", layout="wide")
-st.markdown("""
-<style>
-.block-container { padding-top: 1rem; }
-.metric-card { background: #f6f8fc; border-radius: 12px; padding: 10px 14px; }
-</style>
-""", unsafe_allow_html=True)
 st.title("🗺️ India District Poverty Mapping — GEE + CNN / U-Net / Hybrid")
 st.caption("Click any district in India to fetch features from GEE and train three models on a local patch.")
 
@@ -139,10 +131,10 @@ def add_ee_image_to_folium(m: folium.Map, ee_image: ee.Image, vis_params: dict, 
         control=True,
     ).add_to(m)
 
-# --- NEW: ultra-robust exporter ---
+# --- Robust exporters --------------------------------------------------------
 def ee_to_numpy_robust(image: ee.Image, region: ee.Geometry, base_scale: int, crs: str) -> np.ndarray:
     """
-    1) Try geemap.ee_to_numpy at (scale, 2x, 4x)
+    1) Try geemap.ee_to_numpy at (scale, 2×, 4×)
     2) If that fails, do band-wise sampleRectangle after a common reproject.
     """
     last_err = None
@@ -157,7 +149,7 @@ def ee_to_numpy_robust(image: ee.Image, region: ee.Geometry, base_scale: int, cr
         bands: List[str] = image.bandNames().getInfo()
         out = None
         for i, b in enumerate(bands):
-            band_img = image.select([b]).reproject(crs=crs, scale=int(base_scale*4))
+            band_img = image.select([b]).unmask(0).reproject(crs=crs, scale=int(base_scale*4))
             data = band_img.sampleRectangle(region=region, defaultValue=0).getInfo()
             arr2d = np.array(data[b], dtype=np.float32)
             if out is None:
@@ -169,6 +161,38 @@ def ee_to_numpy_robust(image: ee.Image, region: ee.Geometry, base_scale: int, cr
         return out
     except Exception as e2:
         raise RuntimeError(f"Failed to convert EE image to numpy. Last error: {last_err}\nFallback error: {e2}")
+
+def ee_patch_neighborhood(image: ee.Image, point: ee.Geometry.Point, size_km: float, scale: int, crs: str) -> np.ndarray:
+    """
+    Third fallback: sample a patch using neighborhoodToArray kernel around the point.
+    This avoids region/tiling issues entirely.
+    """
+    # pixels across (cap to avoid huge arrays)
+    size_px = max(8, int(round((size_km * 1000.0) / float(scale))))
+    size_px = min(size_px, 256)
+    radius = max(1, size_px // 2)
+
+    bands = image.bandNames().getInfo()
+    arr_img = image.unmask(0).reproject(crs=crs, scale=scale).neighborhoodToArray(
+        ee.Kernel.square(radius, 'pixels', True)
+    )
+
+    feat = arr_img.sample(point, scale=scale, numPixels=1, geometries=False).first()
+    if feat is None:
+        raise RuntimeError("Neighborhood sample returned None.")
+
+    data = feat.get('array').getInfo()
+    arr = np.array(data, dtype=np.float32)
+    # Expect [bands, rows, cols]; transpose to [rows, cols, bands].
+    if arr.ndim != 3:
+        raise RuntimeError(f"Neighborhood array has unexpected shape: {arr.shape}")
+    if arr.shape[0] == len(bands):
+        arr = np.transpose(arr, (1, 2, 0))
+    elif arr.shape[-1] == len(bands):
+        pass  # already rows, cols, bands
+    else:
+        raise RuntimeError(f"Neighborhood array band dimension mismatch: {arr.shape} vs {len(bands)}")
+    return arr
 
 # ---------- GEE Processor ----------
 class GEEProcessor:
@@ -315,7 +339,11 @@ class GEEProcessor:
         self, lat: float, lon: float, size_km: float = 12, scale: int = 100, num_classes: int = 3
     ) -> Tuple[np.ndarray, np.ndarray]:
         """
-        Build region, then try (scale, 2×, 4×) and (size_km, 0.75×, 0.5×) combinations.
+        Build region, then try:
+          - geemap.ee_to_numpy (scale, 2×, 4×)
+          - band-wise sampleRectangle
+          - neighborhoodToArray (point kernel)   <-- NEW & most robust
+        Also retries with smaller region sizes.
         """
         pt = ee.Geometry.Point([lon, lat])
 
@@ -323,24 +351,40 @@ class GEEProcessor:
         if stack is None:
             raise RuntimeError("Feature stack not ready")
 
-        # try shrinking region if needed
+        last_error = None
         for km_factor in [1.0, 0.75, 0.5]:
             size_try = size_km * km_factor
             region = pt.buffer(size_try * 1000 / 2.0).bounds().intersection(self.study_area, maxError=1)
             # robust export
             try:
+                # try standard & band-wise first
                 X = ee_to_numpy_robust(stack, region=region, base_scale=scale, crs='EPSG:4326')
-                X = np.nan_to_num(np.array(X, dtype=np.float32), nan=0.0)
-                pov = ee_to_numpy_robust(self.features['Poverty_Index'], region=region, base_scale=scale, crs='EPSG:4326')
-                yf = np.nan_to_num(np.array(pov, dtype=np.float32), nan=0.0).squeeze()
+            except Exception as e1:
+                # final fallback: neighborhoodToArray around the point
+                try:
+                    X = ee_patch_neighborhood(stack, pt, size_try, scale, 'EPSG:4326')
+                except Exception as e2:
+                    last_error = (e1, e2)
+                    continue
 
-                flat = yf.flatten()
-                qs = np.quantile(flat[~np.isnan(flat)], np.linspace(0, 1, num_classes + 1))
-                y = np.digitize(yf, qs[1:-1], right=False).astype(np.int32)
-                return X, y
-            except Exception as e:
-                last_error = e
+            X = np.nan_to_num(np.array(X, dtype=np.float32), nan=0.0)
+
+            # label via same export path
+            try:
+                y_img = self.features['Poverty_Index']
+                try:
+                    pov = ee_to_numpy_robust(y_img, region=region, base_scale=scale, crs='EPSG:4326')
+                except Exception:
+                    pov = ee_patch_neighborhood(y_img, pt, size_try, scale, 'EPSG:4326')
+            except Exception as e3:
+                last_error = e3
                 continue
+
+            yf = np.nan_to_num(np.array(pov, dtype=np.float32), nan=0.0).squeeze()
+            flat = yf.flatten()
+            qs = np.quantile(flat[~np.isnan(flat)], np.linspace(0, 1, num_classes + 1))
+            y = np.digitize(yf, qs[1:-1], right=False).astype(np.int32)
+            return X, y
 
         raise RuntimeError(f"Patch export failed even after retries: {last_error}")
 
@@ -494,7 +538,6 @@ if clicked:
         if not ok:
             st.error("Failed to process features from GEE."); st.stop()
 
-        # --- robust patch export (now with retries over region size) ---
         X_full, y_full = processor.numpy_patch_from_point(
             lat=lat, lon=lon, size_km=size_km, scale=100, num_classes=num_classes
         )
