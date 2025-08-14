@@ -1,5 +1,5 @@
 """
-India District Poverty Mapping — Single-file Streamlit App (latest)
+India District Poverty Mapping — Single-file Streamlit App (latest, folium fix)
 - Auth from secret/env GCP_SA_KEY (raw JSON, base64(JSON), or TOML inline table).
 - No auth/upload UI.
 - Click any district in India → pulls features from GEE → trains CNN / U-Net / Hybrid → shows metrics.
@@ -457,6 +457,21 @@ with st.sidebar:
     st.info("Click a district on the map to run the pipeline.")
 
 # ----------------------------------------------------
+# Helper: add EE layer to Folium WITHOUT geemap helper (robust)
+# ----------------------------------------------------
+def add_ee_image_to_folium(m: folium.Map, ee_image: ee.Image, vis_params: dict, name: str):
+    """Create a folium TileLayer from an ee.Image using Earth Engine tile URL."""
+    map_id = ee_image.getMapId(vis_params or {})
+    tile_url = map_id["tile_fetcher"].url_format
+    folium.raster_layers.TileLayer(
+        tiles=tile_url,
+        attr="Google Earth Engine",
+        name=name,
+        overlay=True,
+        control=True,
+    ).add_to(m)
+
+# ----------------------------------------------------
 # Map (India ADM2 boundaries) + click capture OR manual fallback
 # ----------------------------------------------------
 clicked = None
@@ -477,7 +492,8 @@ if HAVE_ST_FOLIUM:
         fill    = ee.Image().paint(adm2, 1).visualize(palette=['000000'], opacity=0.0)
         adm2_vis = ee.ImageCollection([fill, outline]).mosaic()
 
-    geemap.ee_tile_layer(adm2_vis, {}, "Districts (ADM2)").add_to(m)
+    # Use robust helper instead of geemap.ee_tile_layer(...).add_to(m)
+    add_ee_image_to_folium(m, adm2_vis, {}, "Districts (ADM2)")
 
     st_map = st_folium(m, height=600, width=None, returned_objects=["last_clicked"])
     if st_map and st_map.get("last_clicked"):
@@ -536,10 +552,6 @@ if clicked:
         X_full, y_full = processor.numpy_patch_from_point(
             lat=lat, lon=lon, size_km=size_km, scale=100, num_classes=num_classes
         )
-        feat_names = [
-            'MODIS_NDVI','NDBI','LandCover','Water_Cover','Built_up',
-            'Pop_Normalized','NTL_Normalized','Urban_Index','Rural_Index','Infrastructure_Index'
-        ]
         st.write("**Feature stack shape**:", X_full.shape, " | **Label shape**:", y_full.shape)
 
         # Normalize continuous channels ~[0,1] (keep categorical masks as-is)
