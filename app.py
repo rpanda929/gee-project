@@ -1,6 +1,6 @@
 """
 India District Poverty Mapping — Single-file Streamlit App
-(folium + ultra-robust NumPy export: geemap -> bandwise sampleRectangle -> neighborhoodToArray)
+(folium + ultra-robust NumPy export: geemap -> bandwise sampleRectangle -> toArray().neighborhoodToArray())
 
 Env / Secrets required:
   - GCP_SA_KEY      : base64(key.json) or full JSON (one line / triple-quoted)
@@ -164,32 +164,37 @@ def ee_to_numpy_robust(image: ee.Image, region: ee.Geometry, base_scale: int, cr
 
 def ee_patch_neighborhood(image: ee.Image, point: ee.Geometry.Point, size_km: float, scale: int, crs: str) -> np.ndarray:
     """
-    Third fallback: sample a patch using neighborhoodToArray kernel around the point.
-    This avoids region/tiling issues entirely.
+    Third fallback (FIXED): sample a patch using toArray().neighborhoodToArray() around the point.
+    This bypasses rectangular region/tiling issues for stubborn districts.
     """
-    # pixels across (cap to avoid huge arrays)
     size_px = max(8, int(round((size_km * 1000.0) / float(scale))))
     size_px = min(size_px, 256)
     radius = max(1, size_px // 2)
 
     bands = image.bandNames().getInfo()
-    arr_img = image.unmask(0).reproject(crs=crs, scale=scale).neighborhoodToArray(
-        ee.Kernel.square(radius, 'pixels', True)
+
+    # ----- CRITICAL FIX: use toArray().neighborhoodToArray() -----
+    arr_img = (
+        image.unmask(0)            # fill nodata
+             .toArray()            # stack bands -> 1D array along band axis
+             .reproject(crs=crs, scale=scale)
+             .neighborhoodToArray(ee.Kernel.square(radius, 'pixels', True))
     )
 
     feat = arr_img.sample(point, scale=scale, numPixels=1, geometries=False).first()
     if feat is None:
         raise RuntimeError("Neighborhood sample returned None.")
 
-    data = feat.get('array').getInfo()
+    data = feat.get('array').getInfo()   # property name is 'array' after toArray()
     arr = np.array(data, dtype=np.float32)
-    # Expect [bands, rows, cols]; transpose to [rows, cols, bands].
+
+    # Expected shape: [bands, rows, cols]; make [rows, cols, bands]
     if arr.ndim != 3:
         raise RuntimeError(f"Neighborhood array has unexpected shape: {arr.shape}")
     if arr.shape[0] == len(bands):
         arr = np.transpose(arr, (1, 2, 0))
     elif arr.shape[-1] == len(bands):
-        pass  # already rows, cols, bands
+        pass
     else:
         raise RuntimeError(f"Neighborhood array band dimension mismatch: {arr.shape} vs {len(bands)}")
     return arr
@@ -342,7 +347,7 @@ class GEEProcessor:
         Build region, then try:
           - geemap.ee_to_numpy (scale, 2×, 4×)
           - band-wise sampleRectangle
-          - neighborhoodToArray (point kernel)   <-- NEW & most robust
+          - toArray().neighborhoodToArray()   <-- FIXED & most robust
         Also retries with smaller region sizes.
         """
         pt = ee.Geometry.Point([lon, lat])
@@ -360,7 +365,7 @@ class GEEProcessor:
                 # try standard & band-wise first
                 X = ee_to_numpy_robust(stack, region=region, base_scale=scale, crs='EPSG:4326')
             except Exception as e1:
-                # final fallback: neighborhoodToArray around the point
+                # final fallback: toArray().neighborhoodToArray around the point
                 try:
                     X = ee_patch_neighborhood(stack, pt, size_try, scale, 'EPSG:4326')
                 except Exception as e2:
