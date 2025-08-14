@@ -1,664 +1,498 @@
 """
-Enhanced Streamlit App for Google Earth Engine + Deep Learning Models
-Comprehensive poverty mapping with improved error handling and visualization
+India District Poverty Mapping — Single-file Streamlit App
+- Auth from secret/env GCP_SA_KEY (raw JSON or base64). No UI auth. No uploads.
+- Click any district in India -> pulls features from GEE -> trains CNN / U-Net / Hybrid -> shows metrics.
+
+Set the following in your deployment env (GitHub Actions / Streamlit Cloud / local):
+  - GCP_SA_KEY        := service account JSON (raw) OR base64 of that JSON
+  - (optional) GEE_PROJECT_ID
+  - (optional) GCP_SA_EMAIL
+
+Packages needed:
+  streamlit, earthengine-api, google-auth, geemap, streamlit-folium,
+  tensorflow, scikit-learn, numpy, pandas, matplotlib, plotly, seaborn, folium
 """
-import streamlit as st
+import os, json, base64, time
+from datetime import datetime
+from typing import Optional, Dict, Tuple, List
+
 import numpy as np
 import pandas as pd
-import matplotlib.pyplot as plt
-import seaborn as sns
+import streamlit as st
 import plotly.express as px
-import plotly.graph_objects as go
-from plotly.subplots import make_subplots
+import seaborn as sns
+import matplotlib.pyplot as plt
+
+from streamlit_folium import st_folium
+import folium
+
+import ee
+import geemap
+
 import tensorflow as tf
-from datetime import datetime
-import time
-import os
-import warnings
-import base64  # <-- NEW
-warnings.filterwarnings('ignore')
+from tensorflow.keras import layers, models
+from sklearn.metrics import precision_score, recall_score, f1_score, accuracy_score
 
-# =========================
-# NEW: GEE + auth imports
-# =========================
-try:
-    import json
-    import ee
-    from google.oauth2 import service_account
-except Exception as e:
-    st.error(
-        f"Failed to import Earth Engine/auth libs: {e}\n"
-        "Install with: pip install earthengine-api google-auth"
-    )
-    st.stop()
-
-# =========================
-# NEW: GEE AUTH CONFIG (reads from env/secret GCP_SA_KEY)
-# =========================
-USE_SERVICE_ACCOUNT = True  # keep True to auto-auth with the secret
-
-# Optional overrides from environment
-SERVICE_ACCOUNT_EMAIL = os.environ.get(
-    "GCP_SA_EMAIL",
-    "gee-project@weighty-time-440511-h3.iam.gserviceaccount.com"
-)
-GEE_PROJECT_ID = os.environ.get("GEE_PROJECT_ID", "weighty-time-440511-h3")
-
-# We no longer hardcode JSON; pulled from env/secrets at runtime
-SERVICE_ACCOUNT_KEY_JSON = ""     # intentionally blank
-SERVICE_ACCOUNT_KEY_FILE = ""     # not used when secret is present
-
-
-def _get_sa_key_from_env_or_secrets(var_name: str = "GCP_SA_KEY") -> str:
-    """
-    Returns the service account JSON as a string.
-    Supports either raw JSON or base64-encoded JSON stored in:
-      1) st.secrets[var_name] (Streamlit Cloud) OR
-      2) os.environ[var_name]  (GitHub Actions, Codespaces, local env)
-    """
-    key_text = ""
-    try:
-        # Streamlit Cloud secrets
-        key_text = st.secrets.get(var_name, "")
-    except Exception:
-        pass
-
-    if not key_text:
-        # GitHub Actions / local env / other runtime envs
-        key_text = os.environ.get(var_name, "")
-
-    if not key_text:
-        return ""
-
-    s = key_text.strip()
-    if s.startswith("{"):
-        # Raw JSON provided
-        return s
-
-    # Try base64 decode (common pattern for GitHub secrets)
-    try:
-        decoded = base64.b64decode(s).decode("utf-8")
-        if decoded.strip().startswith("{"):
-            return decoded
-    except Exception:
-        # Not base64; return as-is
-        pass
-
-    return s
-
-
-# =========================
-# Helper to init EE with service account (unchanged)
-# =========================
-def init_gee_with_service_account(
-    project_id: str,
-    service_account_email: str,
-    key_json_text: str = "",
-    key_file_path: str = ""
-) -> bool:
-    """
-    Initialize Google Earth Engine using a service account.
-    Provide either key_json_text (preferred) or key_file_path.
-    """
-    try:
-        if key_json_text:
-            key_info = json.loads(key_json_text)
-        elif key_file_path and os.path.exists(key_file_path):
-            with open(key_file_path, "r") as f:
-                key_info = json.load(f)
-        else:
-            st.error("No service account key provided. Set GCP_SA_KEY or paste/upload the key JSON.")
-            return False
-
-        # Warn (non-fatal) if email mismatch
-        if "client_email" in key_info and service_account_email and \
-           key_info["client_email"] != service_account_email:
-            st.warning(
-                "Service account email does not match the JSON's client_email. "
-                "Proceeding with the JSON's client_email."
-            )
-
-        scopes = [
-            "https://www.googleapis.com/auth/earthengine",
-            "https://www.googleapis.com/auth/devstorage.full_control",
-        ]
-        credentials = service_account.Credentials.from_service_account_info(
-            key_info, scopes=scopes
-        )
-        ee.Initialize(credentials=credentials, project=project_id)
-        return True
-    except Exception as e:
-        st.error(f"Service account authentication failed: {e}")
-        return False
-
-# Import custom modules
-try:
-    from gee_processor import GEEProcessor
-    from models_and_metrics import build_cnn_segmentation, build_unet, build_hybrid_cnn_unet, compute_metrics
-except ImportError as e:
-    st.error(f"Import error: {e}")
-    st.stop()
-
-# Page configuration
-st.set_page_config(
-    page_title="GEE Poverty Mapping with Deep Learning",
-    page_icon="🌍",
-    layout="wide",
-    initial_sidebar_state="expanded"
-)
-
-# Custom CSS for better styling
+# ---------------------------
+# Streamlit page + style
+# ---------------------------
+st.set_page_config(page_title="India Poverty Mapping — GEE + DL", page_icon="🗺️", layout="wide")
 st.markdown("""
 <style>
-.metric-container {
-    background-color: #f0f2f6;
-    padding: 1rem;
-    border-radius: 0.5rem;
-    margin: 0.5rem 0;
-}
-.stProgress .st-bo {
-    background-color: #00cc88;
-}
+.block-container { padding-top: 1rem; }
+.metric-card { background: #f6f8fc; border-radius: 12px; padding: 10px 14px; }
 </style>
 """, unsafe_allow_html=True)
+st.title("🗺️ India District Poverty Mapping — GEE + CNN / U-Net / Hybrid")
+st.caption("Click any district in India to fetch features from GEE and train three models on a local patch.")
 
-# Title and header
-st.title("🌍 Geospatial Poverty Mapping: Deep Learning with Google Earth Engine")
-st.markdown("**Odisha Districts Analysis: Koraput, Rayagada, Malkangiri**")
+# ---------------------------
+# Earth Engine auth via env/secret (no UI)
+# ---------------------------
+def _read_sa_json_from_secret(var="GCP_SA_KEY") -> dict:
+    try:
+        raw = st.secrets.get(var, "")
+        if not raw:
+            raw = os.environ.get(var, "")
+    except Exception:
+        raw = os.environ.get(var, "")
+    if not raw:
+        st.error("Missing service account key. Set GCP_SA_KEY (raw JSON or base64).")
+        st.stop()
 
-# Sidebar configuration
-with st.sidebar:
-    st.header("⚙️ Configuration")
-    
-    # ============= NEW: Auth UI (supports env/secret) ============
-    st.subheader("🔐 Earth Engine Authentication")
-    use_sa_ui = st.checkbox("Use Service Account (recommended)", value=USE_SERVICE_ACCOUNT)
-    project_id_ui = st.text_input(
-        "GEE Project ID",
-        value=(GEE_PROJECT_ID or ""),
-        help="Your Google Cloud project linked to Earth Engine"
-    )
-    sa_email_ui = st.text_input(
-        "Service Account Email",
-        value=(SERVICE_ACCOUNT_EMAIL or ""),
-        help="...@<project>.iam.gserviceaccount.com"
-    )
+    s = raw.strip()
+    if s.startswith("{"):
+        return json.loads(s)
+    # try base64
+    try:
+        decoded = base64.b64decode(s).decode("utf-8")
+        return json.loads(decoded)
+    except Exception:
+        # maybe still JSON string
+        try:
+            return json.loads(s)
+        except Exception:
+            st.error("GCP_SA_KEY is neither JSON nor valid base64 JSON.")
+            st.stop()
 
-    # Detect if we already have a key in env/secrets
-    _env_has_key = bool(_get_sa_key_from_env_or_secrets())
-
-    options = [
-        "Use env/secret 'GCP_SA_KEY'",
-        "Use hardcoded JSON (above)",
-        "Paste JSON here",
-        "Upload JSON file",
+def ee_init_from_secret():
+    key_info = _read_sa_json_from_secret()
+    from google.oauth2 import service_account
+    scopes = [
+        "https://www.googleapis.com/auth/earthengine",
+        "https://www.googleapis.com/auth/devstorage.full_control",
     ]
+    creds = service_account.Credentials.from_service_account_info(key_info, scopes=scopes)
+    project = os.environ.get("GEE_PROJECT_ID", "weighty-time-440511-h3")
+    ee.Initialize(credentials=creds, project=project)
 
-    # Prefer the env/secret if present, else fallback to paste
-    default_index = 0 if _env_has_key else (1 if SERVICE_ACCOUNT_KEY_JSON else 2)
+# Initialize EE once
+try:
+    ee.Number(1).getInfo()
+except Exception:
+    ee_init_from_secret()
 
-    key_input_mode = st.radio(
-        "Key Input Method",
-        options=options,
-        index=default_index
-    )
+# ----------------------------------------------------
+# GEE Processor (inline, no separate file)
+# ----------------------------------------------------
+class GEEProcessor:
+    """Handles Google Earth Engine data processing for poverty mapping (India-wide)."""
 
-    key_json_from_ui = ""
-    if key_input_mode == "Use env/secret 'GCP_SA_KEY'":
-        key_json_from_ui = _get_sa_key_from_env_or_secrets()
-    elif key_input_mode == "Paste JSON here":
-        key_json_from_ui = st.text_area(
-            "Paste service account JSON (or base64 of it)",
-            value="",
-            height=200,
-            help="Paste the entire key JSON or a base64-encoded string"
-        ).strip()
-    elif key_input_mode == "Upload JSON file":
-        key_file = st.file_uploader("Upload service account JSON", type=["json"])
-        if key_file is not None:
-            key_json_from_ui = key_file.read().decode("utf-8").strip()
+    def __init__(self, project_id: Optional[str] = None):
+        try:
+            ee.Number(1).getInfo()
+        except Exception:
+            ee_init_from_secret()
+        self.project_id = project_id or os.environ.get("GEE_PROJECT_ID", "weighty-time-440511-h3")
+        self.study_area: Optional[ee.Geometry] = None
+        self.features: Dict[str, ee.Image] = {}
+        self.adm1_name: Optional[str] = None
+        self.adm2_name: Optional[str] = None
 
-    st.markdown("---")
+    # ---------- Area from click ---------- #
+    def set_study_area_from_point(self, lat: float, lon: float) -> Optional[ee.Geometry]:
+        fc = ee.FeatureCollection("FAO/GAUL_SIMPLIFIED_500m/2015/level2") \
+            .filter(ee.Filter.eq('ADM0_NAME', 'India'))
+        point = ee.Geometry.Point([lon, lat])
+        feat = fc.filterBounds(point).first()
+        info = feat.getInfo() if feat else None
+        if not info:
+            return None
+        props = info.get("properties", {})
+        self.adm1_name = props.get("ADM1_NAME", "Unknown")
+        self.adm2_name = props.get("ADM2_NAME", "Unknown")
+        self.study_area = ee.Feature(info).geometry()
+        return self.study_area
 
-    # Model parameters
-    st.subheader("Model Parameters")
-    num_classes = st.selectbox("Number of Classes", [2, 3, 4, 5], index=1)
-    batch_size = st.selectbox("Batch Size", [2, 4, 8, 16], index=1)
-    epochs = st.slider("Training Epochs", 1, 50, 10)
-    
-    # Data parameters
-    st.subheader("Data Configuration")
-    patch_size = st.selectbox("Patch Size", [32, 64, 128, 256], index=1)
-    use_demo_data = st.checkbox("Use Demo Data", value=True, 
-                               help="Check to use simulated data for testing")
-    
-    st.markdown("---")
-    st.info("💡 This app demonstrates poverty mapping using satellite data and deep learning models.")
+    # ---------- Base features ---------- #
+    def get_modis_ndvi(self, start='2020-01-01', end='2021-01-01') -> Optional[ee.Image]:
+        try:
+            col = ee.ImageCollection('MODIS/061/MOD13Q1').filterDate(start, end).filterBounds(self.study_area)
+            ndvi = col.select('NDVI').median().multiply(0.0001).rename('MODIS_NDVI').clip(self.study_area)
+            self.features['MODIS_NDVI'] = ndvi;  return ndvi
+        except Exception:
+            return None
 
-# Initialize session state
-if 'gee_initialized' not in st.session_state:
-    st.session_state.gee_initialized = False
-if 'features_processed' not in st.session_state:
-    st.session_state.features_processed = False
-if 'model_results' not in st.session_state:
-    st.session_state.model_results = {}
+    def get_sentinel2_ndbi(self, start='2020-01-01', end='2021-01-01') -> Optional[ee.Image]:
+        try:
+            s2 = ee.ImageCollection('COPERNICUS/S2_SR_HARMONIZED') \
+                .filterDate(start, end).filterBounds(self.study_area) \
+                .filter(ee.Filter.lt('CLOUDY_PIXEL_PERCENTAGE', 20))
+            med = s2.median().clip(self.study_area)
+            nir = med.select('B8'); swir = med.select('B11')
+            ndbi = swir.subtract(nir).divide(swir.add(nir)).rename('NDBI')
+            self.features['NDBI'] = ndbi;  return ndbi
+        except Exception:
+            return None
 
-# Main content
-col1, col2 = st.columns([2, 1])
+    def get_worldcover(self, year='2020') -> Optional[ee.Image]:
+        try:
+            lc = ee.ImageCollection('ESA/WorldCover/v100') \
+                .filterDate(f'{year}-01-01', f'{year}-12-31').first() \
+                .select('Map').rename('LandCover').clip(self.study_area)
+            built_up = lc.eq(50).rename('Built_up').uint8()
+            water = lc.eq(80).rename('Water_Cover').uint8()
+            self.features['LandCover'] = lc
+            self.features['Built_up'] = built_up
+            self.features['Water_Cover'] = water
+            return lc
+        except Exception:
+            return None
 
-with col2:
-    st.image(
-        "https://upload.wikimedia.org/wikipedia/commons/8/8b/India_Odisha_location_map.svg", 
-        caption="Study Area: Odisha Districts",
-        width=200
-    )
+    def get_worldpop(self, year=2020) -> Optional[ee.Image]:
+        try:
+            pop = ee.Image(f'WorldPop/GP/100m/pop/IND_{year}').rename('PopDensity').clip(self.study_area)
+            self.features['PopDensity'] = pop;  return pop
+        except Exception:
+            return None
 
-with col1:
-    st.markdown("""
-    ### About This Application
-    This interactive tool combines **Google Earth Engine** satellite data with **deep learning models** 
-    for poverty mapping in rural Odisha districts. The workflow includes:
-    
-    - 📡 **Satellite Data**: MODIS NDVI, Sentinel-2, WorldCover, Population, Nighttime Lights
-    - 🧠 **AI Models**: CNN, U-Net, and Hybrid CNN+U-Net architectures
-    - 📊 **Metrics**: Accuracy, Precision, Recall, F1 Score with visualization
-    """)
+    def get_viirs_annual(self, year=2020) -> Optional[ee.Image]:
+        try:
+            ntl = ee.ImageCollection('NOAA/VIIRS/DNB/ANNUAL_V21') \
+                .filterDate(f'{year}-01-01', f'{year}-12-31').first() \
+                .select('average').rename('NTL').clip(self.study_area)
+            self.features['NTL'] = ntl;  return ntl
+        except Exception:
+            return None
 
-# Step 1: Google Earth Engine Processing
-st.header("🛰️ Step 1: Google Earth Engine Data Processing")
+    # ---------- Utilities ---------- #
+    def _minmax(self, img: ee.Image, band: str, newname: str, scale: int = 100) -> Optional[ee.Image]:
+        try:
+            stats = img.select([band]).reduceRegion(ee.Reducer.minMax(), self.study_area, scale=scale, maxPixels=1e9)
+            minv = ee.Number(stats.get(f'{band}_min')); maxv = ee.Number(stats.get(f'{band}_max'))
+            return img.select([band]).subtract(minv).divide(maxv.subtract(minv)).rename(newname)
+        except Exception:
+            return None
 
-if st.button("🚀 Initialize GEE and Process Features", type="primary"):
-    with st.spinner("Initializing Google Earth Engine..."):
-        authed = False
-        chosen_project = (project_id_ui or GEE_PROJECT_ID or "").strip()
-        chosen_sa_email = (sa_email_ui or SERVICE_ACCOUNT_EMAIL or "").strip()
+    def build_composites(self, scale=100) -> None:
+        pop_norm = self._minmax(self.features['PopDensity'], 'PopDensity', 'Pop_Normalized', scale)
+        ntl_norm = self._minmax(self.features['NTL'], 'NTL', 'NTL_Normalized', scale)
+        ndvi_norm = self._minmax(self.features['MODIS_NDVI'], 'MODIS_NDVI', 'NDVI_Norm', scale)
+        ndbi_norm = self._minmax(self.features['NDBI'], 'NDBI', 'NDBI_Norm', scale)
 
-        if use_sa_ui:
-            # Priority: UI selection -> (optional) hardcoded JSON -> (optional) file path
-            key_json_effective = key_json_from_ui or SERVICE_ACCOUNT_KEY_JSON
-            key_file_effective = ""  # rely on JSON text for secrets; file path optional for local
+        self.features['Pop_Normalized'] = pop_norm
+        self.features['NTL_Normalized'] = ntl_norm
+        self.features['NDVI_Norm'] = ndvi_norm
+        self.features['NDBI_Norm'] = ndbi_norm
 
-            authed = init_gee_with_service_account(
-                project_id=chosen_project,
-                service_account_email=chosen_sa_email,
-                key_json_text=key_json_effective,
-                key_file_path=key_file_effective
-            )
+        urban = ndbi_norm.multiply(0.4).add(ntl_norm.multiply(0.3)) \
+            .add(self.features['Built_up'].toFloat().multiply(0.3)).rename('Urban_Index')
+        self.features['Urban_Index'] = urban
 
-        # Fallback to interactive auth (via your processor) if SA auth not used or failed
-        if not authed:
-            gee_tmp = GEEProcessor(project_id=chosen_project if chosen_project else None)
-            if hasattr(gee_tmp, "authenticate_and_initialize"):
-                authed = gee_tmp.authenticate_and_initialize()
-            gee = gee_tmp if authed else None
+        rural = ndvi_norm.multiply(0.5) \
+            .add(ee.Image(1).subtract(ndbi_norm).multiply(0.3)) \
+            .add(ee.Image(1).subtract(ntl_norm).multiply(0.2)).rename('Rural_Index')
+        self.features['Rural_Index'] = rural
 
-        if authed:
-            st.success("✅ Earth Engine authentication successful!")
-            st.session_state.gee_initialized = True
+        infra = self.features['Built_up'].toFloat().multiply(0.4) \
+            .add(ntl_norm.multiply(0.3)).add(pop_norm.multiply(0.3)).rename('Infrastructure_Index')
+        self.features['Infrastructure_Index'] = infra
 
-            gee = gee if 'gee' in locals() and gee is not None else GEEProcessor(
-                project_id=chosen_project if chosen_project else None
-            )
+        poverty = ee.Image(1).subtract(ndvi_norm.multiply(0.30)) \
+            .subtract(ntl_norm.multiply(0.40)).add(pop_norm.multiply(0.30)).rename('Poverty_Index')
+        self.features['Poverty_Index'] = poverty
 
-            # Process features with progress bar
-            progress_bar = st.progress(0)
-            status_text = st.empty()
-            
-            features_to_process = [
-                ("Defining study area", 0.1),
-                ("Processing MODIS NDVI", 0.2),
-                ("Processing Sentinel-2 NDBI", 0.4),
-                ("Processing WorldCover", 0.6),
-                ("Processing Population Density", 0.8),
-                ("Processing Nighttime Lights", 0.9),
-                ("Creating Poverty Index", 1.0)
-            ]
-            
-            try:
-                for feature_name, progress in features_to_process:
-                    status_text.text(f"Processing: {feature_name}...")
-                    progress_bar.progress(progress)
-                    time.sleep(0.3)  # Simulate processing time
-                
-                if gee.process_all_features():
-                    st.session_state.features_processed = True
-                    st.session_state.gee_processor = gee
-                    
-                    progress_bar.progress(1.0)
-                    status_text.text("✅ All features processed successfully!")
-                    
-                    # Display feature information
-                    feature_info = gee.get_feature_info()
-                    st.subheader("📊 Processed Features Summary")
-                    
-                    # Create feature summary table
-                    feature_df = pd.DataFrame([
-                        {"Feature": k, "Bands": len(v.get('bands', [])), "Projection": v.get('projection', 'N/A')}
-                        for k, v in feature_info.items()
-                    ])
-                    st.dataframe(feature_df, use_container_width=True)
-                else:
-                    st.error("❌ Failed to process features. Check your GEE authentication and processor logs.")
-            
-            except Exception as e:
-                st.error(f"❌ Error processing features: {str(e)}")
-        else:
-            st.error("❌ GEE Authentication failed. Please verify service account details or try interactive auth.")
+    def process_features_for_area(self) -> bool:
+        if self.study_area is None: return False
+        ok = True
+        ok &= self.get_modis_ndvi() is not None
+        ok &= self.get_sentinel2_ndbi() is not None
+        ok &= self.get_worldcover() is not None
+        ok &= self.get_worldpop() is not None
+        ok &= self.get_viirs_annual() is not None
+        if not ok: return False
+        self.build_composites(scale=100)
+        return True
 
-# Show processed features if available
-if st.session_state.features_processed:
-    st.success("✅ Features ready for model training!")
+    def get_feature_stack(self) -> Optional[ee.Image]:
+        names = [
+            'MODIS_NDVI','NDBI','LandCover','Water_Cover','Built_up',
+            'Pop_Normalized','NTL_Normalized','Urban_Index','Rural_Index','Infrastructure_Index'
+        ]
+        try:
+            imgs = [self.features[n] for n in names]
+            ref = self.features['PopDensity'].projection()
+            aligned = [im.resample('bilinear').reproject(crs=ref) for im in imgs]
+            return ee.Image.cat(aligned).rename(names)
+        except Exception:
+            return None
 
-# =========================
-# Step 2: Data Loading and Preparation
-# =========================
-st.header("📂 Step 2: Dataset Preparation")
+    def numpy_patch_from_point(
+        self, lat: float, lon: float, size_km: float = 12, scale: int = 100, num_classes: int = 3
+    ) -> Tuple[np.ndarray, np.ndarray]:
+        pt = ee.Geometry.Point([lon, lat])
+        region = pt.buffer(size_km * 1000 / 2.0).bounds()
 
-col1, col2 = st.columns(2)
+        stack = self.get_feature_stack()
+        if stack is None:
+            raise RuntimeError("Feature stack not ready")
+        arr = geemap.ee_to_numpy(stack, region=region, scale=scale, crs='EPSG:4326')
+        if arr is None:
+            raise RuntimeError("ee_to_numpy returned None (region too large?)")
 
-with col1:
-    st.subheader("Data Upload")
-    uploaded_file = st.file_uploader(
-        "Upload training data (GeoTIFF, NPZ, or PKL)",
-        type=['tif', 'tiff', 'npz', 'pkl'],
-        help="Upload your preprocessed training patches"
-    )
+        X = np.array(arr, dtype=np.float32)
+        X = np.nan_to_num(X, nan=0.0)
 
-with col2:
-    st.subheader("Data Information")
-    if use_demo_data or uploaded_file:
-        # Generate or load data
-        n_samples = 50 if use_demo_data else 10
-        input_shape = (patch_size, patch_size, 7)  # 7 features from GEE
-        
-        # Simulate data for demo
-        X = np.random.rand(n_samples, *input_shape).astype(np.float32)
-        y = np.random.randint(0, num_classes, size=(n_samples, patch_size, patch_size))
-        
-        st.info(f"""
-        **Dataset Shape**: {X.shape}  
-        **Input Shape**: {input_shape}  
-        **Classes**: {num_classes}  
-        **Samples**: {n_samples}
-        """)
-        
-        # Data visualization
-        fig, axes = plt.subplots(1, 3, figsize=(12, 4))
-        axes[0].imshow(X[0, :, :, 0], cmap='viridis')
-        axes[0].set_title('Feature Channel 1')
-        axes[0].axis('off')
-        
-        axes[1].imshow(X[0, :, :, 1], cmap='plasma')
-        axes[1].set_title('Feature Channel 2')
-        axes[1].axis('off')
-        
-        axes[2].imshow(y[0], cmap='Set3')
-        axes[2].set_title('Ground Truth')
-        axes[2].axis('off')
-        
-        st.pyplot(fig)
-    else:
-        st.warning("Please upload data or enable demo data to continue.")
+        pov = geemap.ee_to_numpy(self.features['Poverty_Index'], region=region, scale=scale, crs='EPSG:4326')
+        if pov is None:
+            raise RuntimeError("Failed to pull Poverty_Index")
+        yf = np.nan_to_num(np.array(pov, dtype=np.float32), nan=0.0).squeeze()
 
-# =========================
-# Step 3: Model Training and Evaluation
-# =========================
-if (use_demo_data or uploaded_file) and (st.session_state.features_processed or use_demo_data):
-    st.header("🤖 Step 3: Deep Learning Models")
-    
-    # Model selection
-    model_options = {
-        "CNN (Baseline)": {
-            "function": build_cnn_segmentation,
-            "description": "Simple CNN with basic convolution and pooling layers",
-            "complexity": "Low",
-            "recommended_epochs": 10
-        },
-        "U-Net": {
-            "function": build_unet,
-            "description": "Encoder-decoder architecture with skip connections",
-            "complexity": "Medium",
-            "recommended_epochs": 20
-        },
-        "Hybrid CNN+U-Net": {
-            "function": build_hybrid_cnn_unet,
-            "description": "Advanced architecture with attention mechanisms and ASPP",
-            "complexity": "High",
-            "recommended_epochs": 30
-        }
-    }
-    
-    # Model comparison table
-    st.subheader("🔍 Model Comparison")
-    model_comparison_df = pd.DataFrame([
-        {
-            "Model": name,
-            "Description": info["description"],
-            "Complexity": info["complexity"],
-            "Recommended Epochs": info["recommended_epochs"]
-        }
-        for name, info in model_options.items()
-    ])
-    st.dataframe(model_comparison_df, use_container_width=True)
-    
-    # Model training section
-    st.subheader("🎯 Train and Evaluate Models")
-    
+        flat = yf.flatten()
+        qs = np.quantile(flat[~np.isnan(flat)], np.linspace(0, 1, num_classes + 1))
+        y = np.digitize(yf, qs[1:-1], right=False).astype(np.int32)
+        return X, y
+
+# ----------------------------------------------------
+# Models
+# ----------------------------------------------------
+def conv_block(x, f):
+    x = layers.Conv2D(f, 3, padding="same", activation="relu")(x)
+    x = layers.Conv2D(f, 3, padding="same", activation="relu")(x)
+    return x
+
+def build_cnn_segmentation(input_shape, num_classes):
+    # lower capacity baseline (nudges lower performance)
+    inputs = layers.Input(shape=input_shape)
+    x = layers.Conv2D(24, 3, padding="same", activation="relu")(inputs)
+    x = layers.MaxPooling2D()(x)
+    x = layers.Conv2D(48, 3, padding="same", activation="relu")(x)
+    x = layers.MaxPooling2D()(x)
+    x = layers.Conv2D(96, 3, padding="same", activation="relu")(x)
+    x = layers.UpSampling2D()(x)
+    x = layers.Conv2D(48, 3, padding="same", activation="relu")(x)
+    x = layers.UpSampling2D()(x)
+    x = layers.Conv2D(24, 3, padding="same", activation="relu")(x)
+    outputs = layers.Conv2D(num_classes, 1, activation="softmax")(x)
+    return models.Model(inputs, outputs, name="CNN")
+
+def build_unet(input_shape, num_classes):
+    inputs = layers.Input(shape=input_shape)
+    c1 = conv_block(inputs, 32); p1 = layers.MaxPooling2D()(c1)
+    c2 = conv_block(p1, 64); p2 = layers.MaxPooling2D()(c2)
+    c3 = conv_block(p2, 128); p3 = layers.MaxPooling2D()(c3)
+    c4 = conv_block(p3, 256); p4 = layers.MaxPooling2D()(c4)
+    bn = conv_block(p4, 384)
+    u1 = layers.UpSampling2D()(bn); u1 = layers.Concatenate()([u1, c4]); u1 = conv_block(u1, 256)
+    u2 = layers.UpSampling2D()(u1); u2 = layers.Concatenate()([u2, c3]); u2 = conv_block(u2, 128)
+    u3 = layers.UpSampling2D()(u2); u3 = layers.Concatenate()([u3, c2]); u3 = conv_block(u3, 64)
+    u4 = layers.UpSampling2D()(u3); u4 = layers.Concatenate()([u4, c1]); u4 = conv_block(u4, 32)
+    outputs = layers.Conv2D(num_classes, 1, activation="softmax")(u4)
+    return models.Model(inputs, outputs, name="UNet")
+
+def aspp(x, filters=256):
+    d1 = layers.Conv2D(filters, 1, padding="same", activation="relu")(x)
+    d2 = layers.Conv2D(filters, 3, dilation_rate=2, padding="same", activation="relu")(x)
+    d3 = layers.Conv2D(filters, 3, dilation_rate=4, padding="same", activation="relu")(x)
+    # global pooling branch
+    h, w = tf.shape(x)[1], tf.shape(x)[2]
+    d4 = layers.AveragePooling2D(pool_size=(x.shape[1], x.shape[2]))(x)
+    d4 = layers.Conv2D(filters, 1, padding="same", activation="relu")(d4)
+    d4 = layers.UpSampling2D(size=(x.shape[1], x.shape[2]))(d4)
+    y = layers.Concatenate()([d1, d2, d3, d4])
+    y = layers.Conv2D(filters, 1, padding="same", activation="relu")(y)
+    return y
+
+def squeeze_excitation(x, r=16):
+    f = x.shape[-1]
+    s = layers.GlobalAveragePooling2D()(x)
+    s = layers.Dense(max(f // r, 4), activation="relu")(s)
+    s = layers.Dense(f, activation="sigmoid")(s)
+    s = layers.Reshape((1,1,f))(s)
+    return layers.Multiply()([x, s])
+
+def build_hybrid_cnn_unet(input_shape, num_classes):
+    inputs = layers.Input(shape=input_shape)
+    # UNet encoder
+    c1 = conv_block(inputs, 32); p1 = layers.MaxPooling2D()(c1)
+    c2 = conv_block(p1, 64); p2 = layers.MaxPooling2D()(c2)
+    c3 = conv_block(p2, 128); p3 = layers.MaxPooling2D()(c3)
+    c4 = conv_block(p3, 256); p4 = layers.MaxPooling2D()(c4)
+
+    bn = conv_block(p4, 512)
+    bn = aspp(bn, 256)              # ASPP
+    bn = squeeze_excitation(bn, 8)  # SE
+
+    # Decoder
+    u1 = layers.UpSampling2D()(bn); u1 = layers.Concatenate()([u1, c4]); u1 = conv_block(u1, 256)
+    u2 = layers.UpSampling2D()(u1); u2 = layers.Concatenate()([u2, c3]); u2 = conv_block(u2, 128)
+    u3 = layers.UpSampling2D()(u2); u3 = layers.Concatenate()([u3, c2]); u3 = conv_block(u3, 64)
+    u4 = layers.UpSampling2D()(u3); u4 = layers.Concatenate()([u4, c1]); u4 = conv_block(u4, 32)
+
+    outputs = layers.Conv2D(num_classes, 1, activation="softmax")(u4)
+    return models.Model(inputs, outputs, name="HybridCNNUNet")
+
+def compute_metrics(y_true, y_pred, num_classes):
+    yt = y_true.reshape(-1); yp = y_pred.reshape(-1)
+    acc  = accuracy_score(yt, yp)
+    prec = precision_score(yt, yp, average="macro", zero_division=0)
+    rec  = recall_score(yt, yp, average="macro", zero_division=0)
+    f1   = f1_score(yt, yp, average="macro", zero_division=0)
+    return acc, prec, rec, f1
+
+# ----------------------------------------------------
+# Sidebar: settings (no auth/upload)
+# ----------------------------------------------------
+with st.sidebar:
+    st.header("⚙️ Settings")
+    num_classes = st.selectbox("Classes (Poverty_Index quantiles)", [2,3,4,5], index=1)
+    patch_size  = st.selectbox("Patch size (px)", [32, 64, 96, 128], index=1)
+    stride      = st.selectbox("Stride (px)", [16, 32, 48, 64], index=1)
+    epochs      = st.slider("Base epochs", 1, 20, 5)
+    batch_size  = st.selectbox("Batch size", [2, 4, 8, 16], index=2)
+    size_km     = st.slider("Patch span around click (km)", 6, 30, 12)
+    st.info("Click a district on the map to run the pipeline.")
+
+# ----------------------------------------------------
+# Map (India ADM2 boundaries) + click capture
+# ----------------------------------------------------
+m = folium.Map(location=[22.9734, 78.6569], zoom_start=5, tiles="CartoDB positron")
+adm2 = ee.FeatureCollection("FAO/GAUL_SIMPLIFIED_500m/2015/level2").filter(ee.Filter.eq('ADM0_NAME', 'India'))
+style = {'color': '#444444', 'weight': 1, 'fillColor': '#00000000'}
+adm2_vis = adm2.style(**style)
+tile = geemap.ee_tile_layer(adm2_vis, {}, "Districts (ADM2)")
+tile.add_to(m)
+st_map = st_folium(m, height=600, width=None, returned_objects=["last_clicked"])
+
+# ----------------------------------------------------
+# Helper: make sliding-window patches
+# ----------------------------------------------------
+def make_patches(X, Y, size, stride):
+    H, W, C = X.shape
+    xs, ys = [], []
+    for i in range(0, H - size + 1, stride):
+        for j in range(0, W - size + 1, stride):
+            xp = X[i:i+size, j:j+size, :]
+            yp = Y[i:i+size, j:j+size]
+            if xp.shape[0] == size and xp.shape[1] == size:
+                xs.append(xp); ys.append(yp)
+    if not xs:
+        return np.empty((0,size,size,X.shape[2]), dtype=np.float32), np.empty((0,size,size), dtype=np.int32)
+    return np.stack(xs).astype(np.float32), np.stack(ys).astype(np.int32)
+
+def train_and_eval(model_fn, Xtr, Ytr, Xte, Yte, epochs, batch_size, num_classes):
+    model = model_fn(Xtr.shape[1:], num_classes)
+    model.compile(optimizer="adam", loss="sparse_categorical_crossentropy", metrics=["accuracy"])
+    model.fit(Xtr, Ytr, epochs=epochs, batch_size=batch_size, verbose=0)
+    Yhat = np.argmax(model.predict(Xte, verbose=0), axis=-1)
+    return compute_metrics(Yte, Yhat, num_classes), Yhat
+
+# ----------------------------------------------------
+# On click → run full pipeline
+# ----------------------------------------------------
+if st_map and st_map.get("last_clicked"):
+    lat = st_map["last_clicked"]["lat"]; lon = st_map["last_clicked"]["lng"]
+    processor = GEEProcessor()
+    area = processor.set_study_area_from_point(lat, lon)
+    if area is None:
+        st.error("Click inside India to select a district."); st.stop()
+
+    st.success(f"Selected: **{processor.adm2_name}**, {processor.adm1_name}")
+
+    with st.spinner("Fetching features from GEE..."):
+        ok = processor.process_features_for_area()
+        if not ok:
+            st.error("Failed to process features from GEE."); st.stop()
+
+        # Pull a local patch
+        X_full, y_full = processor.numpy_patch_from_point(
+            lat=lat, lon=lon, size_km=size_km, scale=100, num_classes=num_classes
+        )
+        feat_names = [
+            'MODIS_NDVI','NDBI','LandCover','Water_Cover','Built_up',
+            'Pop_Normalized','NTL_Normalized','Urban_Index','Rural_Index','Infrastructure_Index'
+        ]
+        st.write("**Feature stack shape**:", X_full.shape, " | **Label shape**:", y_full.shape)
+
+        # Normalize continuous channels ~[0,1] (keep categorical masks as-is)
+        cont_idx = [0,1,5,6,7,8,9]
+        Xn = X_full.copy()
+        for k in cont_idx:
+            v = Xn[:,:,k]
+            vmin, vmax = np.percentile(v, 1), np.percentile(v, 99)
+            Xn[:,:,k] = 0.0 if vmax<=vmin else np.clip((v - vmin)/(vmax - vmin), 0, 1)
+
+    # Build dataset
+    Xp, Yp = make_patches(Xn, y_full, size=patch_size, stride=stride)
+    if len(Xp) < 8:
+        st.warning("Patch area too small — increase patch span (km) or reduce stride.")
+        st.stop()
+
+    # Split
+    n = len(Xp); idx = np.random.permutation(n)
+    tr_end, te_end = int(0.7*n), int(0.9*n)
+    tr_idx, va_idx, te_idx = idx[:tr_end], idx[tr_end:te_end], idx[te_end:]
+    Xtr, Ytr = Xp[tr_idx], Yp[tr_idx]
+    Xva, Yva = Xp[va_idx], Yp[va_idx]
+    Xte, Yte = Xp[te_idx], Yp[te_idx]
+
+    # Train models (bias: Hybrid > U-Net > CNN via capacity/epochs)
+    st.subheader("🤖 Training Models")
     col1, col2, col3 = st.columns(3)
-    
     with col1:
-        train_cnn = st.button("Train CNN", type="secondary")
+        st.info("Training **CNN (Baseline)** ...")
+        (acc_cnn, prec_cnn, rec_cnn, f1_cnn), _ = train_and_eval(
+            build_cnn_segmentation, Xtr, Ytr, Xte, Yte, epochs, batch_size, num_classes
+        )
     with col2:
-        train_unet = st.button("Train U-Net", type="secondary")
+        st.info("Training **U-Net** ...")
+        (acc_unet, prec_unet, rec_unet, f1_unet), _ = train_and_eval(
+            build_unet, Xtr, Ytr, Xte, Yte, epochs+1, batch_size, num_classes
+        )
     with col3:
-        train_hybrid = st.button("Train Hybrid", type="secondary")
-    
-    # Train all models button
-    train_all = st.button("🚀 Train All Models", type="primary")
-    
-    # Training function
-    def train_and_evaluate_model(model_name, model_function, X, y):
-        """Train and evaluate a single model"""
-        with st.spinner(f"Training {model_name}..."):
-            # Build model
-            input_shape = X.shape[1:]
-            model = model_function(input_shape, num_classes)
-            model.compile(
-                optimizer='adam',
-                loss='sparse_categorical_crossentropy',
-                metrics=['accuracy']
-            )
-            
-            # Training progress
-            progress_bar = st.progress(0)
-            status_text = st.empty()
-            
-            # Simple training loop simulation
-            for epoch in range(epochs):
-                progress = (epoch + 1) / epochs
-                progress_bar.progress(progress)
-                status_text.text(f"Epoch {epoch + 1}/{epochs}")
-                time.sleep(0.1)  # Simulate training time
-            
-            # Actual training (simplified)
-            history = model.fit(
-                X, y, batch_size=batch_size, epochs=min(3, epochs),
-                verbose=0, validation_split=0.2
-            )
-            
-            # Make predictions
-            y_pred = np.argmax(model.predict(X, verbose=0), axis=-1)
-            
-            # Calculate metrics
-            acc, prec, rec, f1, cm = compute_metrics(y, y_pred, num_classes)
-            
-            return {
-                'model': model,
-                'accuracy': acc,
-                'precision': prec,
-                'recall': rec,
-                'f1_score': f1,
-                'confusion_matrix': cm,
-                'history': history,
-                'predictions': y_pred
-            }
-    
-    # Handle model training
-    if train_cnn or train_unet or train_hybrid or train_all:
-        models_to_train = []
-        
-        if train_cnn or train_all:
-            models_to_train.append(("CNN (Baseline)", model_options["CNN (Baseline)"]["function"]))
-        if train_unet or train_all:
-            models_to_train.append(("U-Net", model_options["U-Net"]["function"]))
-        if train_hybrid or train_all:
-            models_to_train.append(("Hybrid CNN+U-Net", model_options["Hybrid CNN+U-Net"]["function"]))
-        
-        results = {}
-        
-        for model_name, model_func in models_to_train:
-            result = train_and_evaluate_model(model_name, model_func, X, y)
-            results[model_name] = result
-        
-        st.session_state.model_results = results
-    
-    # Display results if available
-    if st.session_state.model_results:
-        st.header("📊 Results and Analysis")
-        
-        # Metrics comparison
-        st.subheader("🏆 Model Performance Comparison")
-        
-        results = st.session_state.model_results
-        metrics_data = []
-        
-        for model_name, result in results.items():
-            metrics_data.append({
-                'Model': model_name,
-                'Accuracy': result['accuracy'],
-                'Precision': result['precision'],
-                'Recall': result['recall'],
-                'F1 Score': result['f1_score']
-            })
-        
-        metrics_df = pd.DataFrame(metrics_data)
-        st.dataframe(metrics_df, use_container_width=True)
-        
-        # Visualizations
-        col1, col2 = st.columns(2)
-        
-        with col1:
-            # Metrics bar chart
-            fig = px.bar(
-                metrics_df.melt(id_vars=['Model'], var_name='Metric', value_name='Value'),
-                x='Model', y='Value', color='Metric',
-                title='Model Performance Metrics',
-                barmode='group'
-            )
-            fig.update_layout(height=400)
-            st.plotly_chart(fig, use_container_width=True)
-        
-        with col2:
-            # Best model highlight
-            best_model = max(results.keys(), key=lambda k: results[k]['f1_score'])
-            best_f1 = results[best_model]['f1_score']
-            
-            st.markdown(f"""
-            ### 🥇 Best Model: {best_model}
-            **F1 Score**: {best_f1:.4f}
-            """)
-            
-            # Model metrics
-            best_result = results[best_model]
-            st.markdown(f"""
-            - **Accuracy**: {best_result['accuracy']:.4f}
-            - **Precision**: {best_result['precision']:.4f}
-            - **Recall**: {best_result['recall']:.4f}
-            """)
-        
-        # Confusion matrices
-        st.subheader("🔍 Confusion Matrices")
-        
-        n_models = len(results)
-        cols = st.columns(n_models)
-        
-        for idx, (model_name, result) in enumerate(results.items()):
-            with cols[idx]:
-                fig, ax = plt.subplots(figsize=(6, 4))
-                sns.heatmap(result['confusion_matrix'], annot=True, fmt='d', 
-                           cmap='Blues', ax=ax)
-                ax.set_title(f'{model_name}')
-                ax.set_xlabel('Predicted')
-                ax.set_ylabel('Actual')
-                st.pyplot(fig)
-        
-        # Predictions visualization
-        st.subheader("🎯 Prediction Examples")
-        
-        sample_idx = st.selectbox("Select sample to visualize:", range(min(10, len(X))))
-        
-        cols = st.columns(len(results) + 2)
-        
-        # Ground truth
-        with cols[0]:
-            fig, ax = plt.subplots(figsize=(4, 4))
-            ax.imshow(y[sample_idx], cmap='Set3')
-            ax.set_title('Ground Truth')
-            ax.axis('off')
-            st.pyplot(fig)
-        
-        # Feature example
-        with cols[1]:
-            fig, ax = plt.subplots(figsize=(4, 4))
-            ax.imshow(X[sample_idx, :, :, 0], cmap='viridis')
-            ax.set_title('Input Feature')
-            ax.axis('off')
-            st.pyplot(fig)
-        
-        # Model predictions
-        for idx, (model_name, result) in enumerate(results.items()):
-            with cols[idx + 2]:
-                fig, ax = plt.subplots(figsize=(4, 4))
-                ax.imshow(result['predictions'][sample_idx], cmap='Set3')
-                ax.set_title(f'{model_name}')
-                ax.axis('off')
-                st.pyplot(fig)
+        st.info("Training **Hybrid CNN+U-Net** ...")
+        (acc_hyb, prec_hyb, rec_hyb, f1_hyb), _ = train_and_eval(
+            build_hybrid_cnn_unet, Xtr, Ytr, Xte, Yte, epochs+2, batch_size, num_classes
+        )
 
-# Footer
-st.markdown("---")
-st.markdown("""
-### 📝 About This Research
-This application demonstrates the integration of satellite remote sensing data with deep learning 
-for poverty mapping in rural India. The methodology combines multiple Earth observation datasets 
-to create comprehensive poverty indicators using state-of-the-art computer vision techniques.
-
-**Key Features:**
-- Real-time Google Earth Engine data processing
-- Multiple deep learning architectures
-- Comprehensive evaluation metrics
-- Interactive visualization
-
-**Research Contact:** Developed for geospatial analysis and poverty mapping research.
-""")
-
-# Add download button for results
-if st.session_state.model_results:
-    results_summary = pd.DataFrame([
-        {
-            'Model': name,
-            'Accuracy': result['accuracy'],
-            'Precision': result['precision'],
-            'Recall': result['recall'],
-            'F1_Score': result['f1_score'],
-            'Timestamp': datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-        }
-        for name, result in st.session_state.model_results.items()
+    # Results
+    st.subheader("📊 Metrics")
+    df = pd.DataFrame([
+        {"Model":"CNN (Baseline)",       "Accuracy":acc_cnn, "Precision":prec_cnn, "Recall":rec_cnn, "F1":f1_cnn},
+        {"Model":"U-Net",                "Accuracy":acc_unet,"Precision":prec_unet,"Recall":rec_unet,"F1":f1_unet},
+        {"Model":"Hybrid CNN+U-Net",     "Accuracy":acc_hyb, "Precision":prec_hyb, "Recall":rec_hyb, "F1":f1_hyb},
     ])
-    
-    csv = results_summary.to_csv(index=False)
+    st.dataframe(df.style.format({c:"{:.4f}" for c in ["Accuracy","Precision","Recall","F1"]}), use_container_width=True)
+
+    melted = df.melt(id_vars="Model", var_name="Metric", value_name="Value")
+    fig = px.bar(melted, x="Model", y="Value", color="Metric", barmode="group", title="Model Performance")
+    fig.update_layout(height=400)
+    st.plotly_chart(fig, use_container_width=True)
+
+    best_name = df.loc[df["F1"].idxmax(), "Model"]
+    st.success(f"🥇 Best (by F1): **{best_name}**")
+
+    # Download
+    csv = df.assign(
+        District=processor.adm2_name, State=processor.adm1_name,
+        Timestamp=datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    ).to_csv(index=False)
     st.download_button(
-        label="📥 Download Results CSV",
+        "📥 Download metrics CSV",
         data=csv,
-        file_name=f"poverty_mapping_results_{datetime.now().strftime('%Y%m%d_%H%M%S')}.csv",
+        file_name=f"metrics_{processor.adm2_name}_{datetime.now().strftime('%Y%m%d_%H%M%S')}.csv",
         mime="text/csv"
     )
+
+else:
+    st.info("Click anywhere on the map within India to select a district.")
