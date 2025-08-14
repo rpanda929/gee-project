@@ -1,5 +1,5 @@
 """
-India District Poverty Mapping — Single-file Streamlit App
+India District Poverty Mapping — Single-file Streamlit App (latest)
 - Auth from secret/env GCP_SA_KEY (raw JSON, base64(JSON), or even TOML inline table).
 - No auth/upload UI.
 - Click any district in India → pulls features from GEE → trains CNN / U-Net / Hybrid → shows metrics.
@@ -13,7 +13,7 @@ Packages:
   streamlit, earthengine-api, google-auth, geemap, streamlit-folium, folium,
   tensorflow, scikit-learn, numpy, pandas, matplotlib, plotly, seaborn
 """
-import os, json, base64, time
+import os, json, base64, time, re
 from datetime import datetime
 from typing import Optional, Dict, Tuple
 
@@ -64,8 +64,8 @@ st.caption("Click any district in India to fetch features from GEE and train thr
 # ---------------------------
 def _read_sa_json_from_secret(var="GCP_SA_KEY") -> dict:
     """Return SA JSON as dict from Streamlit secrets or env.
-    Accepts: dict (TOML inline table), raw JSON string, base64(JSON), or string with escaped newlines.
-    Raises RuntimeError with clear message if invalid/missing.
+    Accepts: dict (TOML inline table), raw JSON, base64(JSON).
+    Also repairs cases where "private_key" contains literal newlines.
     """
     raw = None
     # Prefer Streamlit secrets if available
@@ -79,7 +79,7 @@ def _read_sa_json_from_secret(var="GCP_SA_KEY") -> dict:
     if raw in (None, ""):
         raise RuntimeError("Missing service account key. Set GCP_SA_KEY (raw JSON or base64 of the entire key.json).")
 
-    # If user accidentally stored as TOML inline table, Streamlit gives us a dict already
+    # If user stored as TOML inline table, Streamlit gives a dict already
     if isinstance(raw, dict):
         return raw
 
@@ -89,18 +89,37 @@ def _read_sa_json_from_secret(var="GCP_SA_KEY") -> dict:
 
     s = str(raw).strip()
 
-    # Raw JSON
+    # ---------- Case A: raw JSON ----------
     if s.startswith("{") and s.endswith("}"):
+        # 1) try straight parse
         try:
             return json.loads(s)
-        except json.JSONDecodeError:
-            # Try un-escaping newlines (common when pasting into TOML)
+        except json.JSONDecodeError as e:
+            # 2) If invalid control character, the private_key likely has real newlines.
+            #    Repair only inside the "private_key": "...." value.
+            try:
+                pat = r'("private_key"\s*:\s*")(?P<key>.*?)(\")'
+                m = re.search(pat, s, flags=re.DOTALL)
+                if m:
+                    key_block = m.group("key")
+                    # Normalize CRLF → LF, then LF → \n escapes (inside the JSON string only)
+                    key_fixed = key_block.replace("\r\n", "\n").replace("\n", r"\n")
+                    s_fixed = s[:m.start("key")] + key_fixed + s[m.end("key"):]
+                    return json.loads(s_fixed)
+            except Exception:
+                pass
+            # 3) One more attempt: sometimes backslashes are double-escaped
             try:
                 return json.loads(s.replace("\\n", "\n"))
-            except Exception as e:
-                raise RuntimeError(f"GCP_SA_KEY looks like JSON but failed to parse: {e}") from e
+            except Exception:
+                pass
+            raise RuntimeError(
+                f"GCP_SA_KEY looks like JSON but failed to parse: {e}. "
+                "Likely the private_key is multi-line. Either paste the original key.json (with \\n escapes) "
+                "or set GCP_SA_KEY to a base64 of key.json."
+            )
 
-    # Base64 → JSON
+    # ---------- Case B: base64(JSON) ----------
     try:
         decoded = base64.b64decode(s, validate=False).decode("utf-8", errors="ignore").strip()
         if decoded.startswith("{") and decoded.endswith("}"):
@@ -108,15 +127,16 @@ def _read_sa_json_from_secret(var="GCP_SA_KEY") -> dict:
     except Exception:
         pass
 
-    # Last attempt: treat string with escaped newlines as JSON
+    # ---------- Last resort: try un-escaping newline escapes ----------
     try:
         return json.loads(s.replace("\\n", "\n"))
     except Exception:
         pass
 
     raise RuntimeError(
-        "GCP_SA_KEY is not valid JSON or base64(JSON).\n"
-        "Store the FULL service-account key.json either triple-quoted in Streamlit secrets or as a clean base64 string."
+        "GCP_SA_KEY is not valid JSON or base64(JSON). "
+        "Store the FULL service-account key.json either triple-quoted in Streamlit secrets "
+        "or as a clean base64 string (of the entire file)."
     )
 
 def ee_init_from_secret():
