@@ -1,28 +1,10 @@
 """
-India District Poverty Mapping — Single-file Streamlit App (folium + robust NumPy export)
-- Auth from secret/env GCP_SA_KEY (raw JSON, base64(JSON), or TOML inline table).
-- No auth/upload UI.
-- Click any district in India → pulls features from GEE → trains CNN / U-Net / Hybrid → shows metrics.
+India District Poverty Mapping — Single-file Streamlit App
+(folium + robust NumPy export + strict EE project init)
 
-Secrets/Env required:
-  - GCP_SA_KEY      := base64(key.json)  ⟵ safest
-                      (or full JSON in triple quotes)
-  - (optional) GEE_PROJECT_ID  e.g. "weighty-time-440511-h3"
-
-requirements.txt:
-  streamlit
-  earthengine-api
-  google-auth
-  geemap
-  streamlit-folium
-  folium
-  tensorflow
-  scikit-learn
-  numpy
-  pandas
-  matplotlib
-  plotly
-  seaborn
+Env / Secrets required:
+  - GCP_SA_KEY      : base64(key.json) or full JSON (one line / triple-quoted)
+  - GEE_PROJECT_ID  : your Cloud project that has Earth Engine enabled
 """
 
 import os, json, base64, re
@@ -36,7 +18,7 @@ import plotly.express as px
 import matplotlib.pyplot as plt
 import seaborn as sns
 
-# --- streamlit-folium (graceful fallback install) ---
+# --- streamlit-folium (graceful install) ---
 HAVE_ST_FOLIUM = True
 try:
     from streamlit_folium import st_folium
@@ -58,9 +40,7 @@ import tensorflow as tf
 from tensorflow.keras import layers, models
 from sklearn.metrics import precision_score, recall_score, f1_score, accuracy_score
 
-# ---------------------------
-# Streamlit page + style
-# ---------------------------
+# ---------- UI ----------
 st.set_page_config(page_title="India Poverty Mapping — GEE + DL", page_icon="🗺️", layout="wide")
 st.markdown("""
 <style>
@@ -71,14 +51,8 @@ st.markdown("""
 st.title("🗺️ India District Poverty Mapping — GEE + CNN / U-Net / Hybrid")
 st.caption("Click any district in India to fetch features from GEE and train three models on a local patch.")
 
-# ---------------------------
-# Robust Earth Engine auth via env/secret (no UI)
-# ---------------------------
+# ---------- Auth helpers ----------
 def _read_sa_json_from_secret(var="GCP_SA_KEY") -> dict:
-    """Return SA JSON as dict from Streamlit secrets or env.
-    Accepts: dict (TOML inline table), raw JSON, base64(JSON).
-    Repairs cases where private_key contains literal newlines.
-    """
     raw = None
     try:
         raw = st.secrets.get(var, None)
@@ -86,7 +60,6 @@ def _read_sa_json_from_secret(var="GCP_SA_KEY") -> dict:
         pass
     if raw is None:
         raw = os.environ.get(var, None)
-
     if raw in (None, ""):
         raise RuntimeError("Missing service account key. Set GCP_SA_KEY (base64 of key.json or raw JSON).")
 
@@ -100,7 +73,6 @@ def _read_sa_json_from_secret(var="GCP_SA_KEY") -> dict:
         try:
             return json.loads(s)
         except json.JSONDecodeError:
-            # Fix private_key newlines if pasted raw
             try:
                 pat = r'("private_key"\s*:\s*")(?P<key>.*?)(\")'
                 m = re.search(pat, s, flags=re.DOTALL)
@@ -113,54 +85,52 @@ def _read_sa_json_from_secret(var="GCP_SA_KEY") -> dict:
                 pass
             return json.loads(s.replace("\\n", "\n"))
 
-    # base64(JSON)
     try:
         decoded = base64.b64decode(s, validate=False).decode("utf-8", errors="ignore").strip()
         if decoded.startswith("{") and decoded.endswith("}"):
             return json.loads(decoded)
     except Exception:
         pass
-
-    # last resort
     return json.loads(s.replace("\\n", "\n"))
 
 def ee_init_from_secret():
     key_info = _read_sa_json_from_secret()
     from google.oauth2 import service_account
+    project = os.environ.get("GEE_PROJECT_ID", "").strip()
+    if not project:
+        st.error("GEE_PROJECT_ID is not set. Set it to a Cloud project that has Earth Engine enabled.")
+        st.stop()
+
     scopes = [
         "https://www.googleapis.com/auth/earthengine",
         "https://www.googleapis.com/auth/devstorage.full_control",
     ]
     creds = service_account.Credentials.from_service_account_info(key_info, scopes=scopes)
-    project = os.environ.get("GEE_PROJECT_ID", "weighty-time-440511-h3")
+
+    # Strict: DO NOT fallback without a project. That causes later compute errors.
     try:
         ee.Initialize(credentials=creds, project=project)
+        # sanity compute to ensure the project actually works
+        _ = ee.Image(1).reduceRegion(ee.Reducer.mean(), ee.Geometry.Point([0,0]).buffer(10000), 1000).getInfo()
     except Exception as e:
-        msg = str(e)
-        if "earthengine.computations.create" in msg or "may not exist" in msg:
-            st.error(
-                f"Earth Engine denied compute for project '{project}'.\n\n"
-                "Fix once:\n"
-                "1) Enable Earth Engine API in Google Cloud\n"
-                "2) EE Code Editor → Settings → Cloud Projects → USE this project\n"
-                "3) Grant your service account IAM (Editor or EE role)\n"
-                "4) EE Settings → Service accounts → add your SA\n"
-            )
-            ee.Initialize(credentials=creds)  # temporary fallback
-            st.info("Initialized EE without explicit project as a temporary fallback.")
-        else:
-            raise
+        st.error(
+            f"Earth Engine failed to initialize with project '{project}'.\n\n"
+            "Fix this in your Google Cloud/Earth Engine setup:\n"
+            "• Enable the Earth Engine API on the project\n"
+            "• Earth Engine Code Editor → Settings → Cloud Projects → USE this project\n"
+            "• IAM: grant your Service Account at least 'Editor' (or EE roles) on the project\n"
+            "• Earth Engine Settings → Service Accounts: add your SA email\n\n"
+            f"Original error:\n{e}"
+        )
+        st.stop()
 
 try:
     ee.Number(1).getInfo()
 except Exception:
     ee_init_from_secret()
 
-# ----------------------------------------------------
-# Utilities
-# ----------------------------------------------------
+# ---------- Map helpers ----------
 def add_ee_image_to_folium(m: folium.Map, ee_image: ee.Image, vis_params: dict, name: str):
-    """Create a folium TileLayer from an ee.Image using Earth Engine tile URL."""
     map_id = ee_image.getMapId(vis_params or {})
     folium.raster_layers.TileLayer(
         tiles=map_id["tile_fetcher"].url_format,
@@ -171,41 +141,45 @@ def add_ee_image_to_folium(m: folium.Map, ee_image: ee.Image, vis_params: dict, 
     ).add_to(m)
 
 def ee_to_numpy_safe(image: ee.Image, region: ee.Geometry, scale: int, crs: str = 'EPSG:4326') -> np.ndarray:
-    """Robust conversion to NumPy with retries on larger scale (coarser res)."""
-    # Try 3 attempts: scale, 2x, 4x
+    """Try geemap.ee_to_numpy (scale, 2x, 4x). If that fails, use sampleRectangle
+       WITHOUT calling bandNames().getInfo() (avoids default-project discovery)."""
+    last_err = None
     for mul in [1, 2, 4]:
-        try_scale = int(scale * mul)
         try:
-            return geemap.ee_to_numpy(image, region=region, scale=try_scale, crs=crs)
+            return geemap.ee_to_numpy(image, region=region, scale=int(scale*mul), crs=crs)
+        except Exception as e:
+            last_err = e
+    # Fallback – one server call, no bandNames().getInfo()
+    try:
+        # Use coarser scale inside the image and sample rectangle
+        img_rp = image.reproject(crs=crs, scale=int(scale*4))
+        data = img_rp.sampleRectangle(region=region, defaultValue=0).getInfo()
+        # data is {bandName: 2D list, ...} — keys are the band names.
+        bands = [k for k, v in data.items() if isinstance(v, list)]
+        # If order matters, try to preserve image order silently (but do not fail if it can’t be fetched)
+        try:
+            ordered = image.bandNames().getInfo()
+            bands = [b for b in ordered if b in data]
         except Exception:
-            # last attempt: small sampleRectangle fallback
-            if mul == 4:
-                bands = image.bandNames().getInfo()
-                img_rp = image.reproject(crs=crs, scale=try_scale)
-                data = img_rp.sampleRectangle(region=region, defaultValue=0).getInfo()
-                # sampleRectangle returns dict of {band: 2D list}
-                arr0 = np.array(data[bands[0]], dtype=np.float32)
-                h, w = arr0.shape
-                stack = np.zeros((h, w, len(bands)), dtype=np.float32)
-                stack[:, :, 0] = arr0
-                for i, b in enumerate(bands[1:], start=1):
-                    stack[:, :, i] = np.array(data[b], dtype=np.float32)
-                return stack
-            # otherwise loop and try coarser scale
-    # should not reach
-    raise RuntimeError("Failed to convert image to numpy.")
+            pass
+        arr0 = np.array(data[bands[0]], dtype=np.float32)
+        h, w = arr0.shape
+        out = np.zeros((h, w, len(bands)), dtype=np.float32)
+        out[:, :, 0] = arr0
+        for i, b in enumerate(bands[1:], start=1):
+            out[:, :, i] = np.array(data[b], dtype=np.float32)
+        return out
+    except Exception as e:
+        raise RuntimeError(f"Failed to convert EE image to numpy. Last error: {last_err}\nFallback error: {e}")
 
-# ----------------------------------------------------
-# GEE Processor
-# ----------------------------------------------------
+# ---------- GEE Processor ----------
 class GEEProcessor:
-    """Handles Google Earth Engine data processing for poverty mapping (India-wide)."""
     def __init__(self, project_id: Optional[str] = None):
         try:
             ee.Number(1).getInfo()
         except Exception:
             ee_init_from_secret()
-        self.project_id = project_id or os.environ.get("GEE_PROJECT_ID", "weighty-time-440511-h3")
+        self.project_id = project_id or os.environ.get("GEE_PROJECT_ID", "")
         self.study_area: Optional[ee.Geometry] = None
         self.features: Dict[str, ee.Image] = {}
         self.adm1_name: Optional[str] = None
@@ -226,7 +200,7 @@ class GEEProcessor:
         self.study_area = ee.Feature(info).geometry()
         return self.study_area
 
-    # Features
+    # --- features ---
     def get_modis_ndvi(self, start='2020-01-01', end='2021-01-01') -> Optional[ee.Image]:
         try:
             col = ee.ImageCollection('MODIS/061/MOD13Q1').filterDate(start, end).filterBounds(self.study_area)
@@ -269,7 +243,7 @@ class GEEProcessor:
             return None
 
     def get_viirs_annual(self, year=2020) -> Optional[ee.Image]:
-        """VIIRS VNL v21 uses band 'avg_rad' (NOT 'average')."""
+        """VIIRS VNL v21 band is 'avg_rad'."""
         try:
             ntl = ee.ImageCollection('NOAA/VIIRS/DNB/ANNUAL_V21') \
                 .filterDate(f'{year}-01-01', f'{year}-12-31').first() \
@@ -278,7 +252,7 @@ class GEEProcessor:
         except Exception:
             return None
 
-    # Utilities
+    # --- composites ---
     def _minmax(self, img: ee.Image, band: str, newname: str, scale: int = 100) -> Optional[ee.Image]:
         try:
             stats = img.select([band]).reduceRegion(ee.Reducer.minMax(), self.study_area, scale=scale, maxPixels=1e9)
@@ -344,14 +318,12 @@ class GEEProcessor:
         self, lat: float, lon: float, size_km: float = 12, scale: int = 100, num_classes: int = 3
     ) -> Tuple[np.ndarray, np.ndarray]:
         pt = ee.Geometry.Point([lon, lat])
-        # keep patch inside the selected district to avoid ocean-only areas on coasts
         region = pt.buffer(size_km * 1000 / 2.0).bounds().intersection(self.study_area, maxError=1)
 
         stack = self.get_feature_stack()
         if stack is None:
             raise RuntimeError("Feature stack not ready")
 
-        # robust numpy extraction with retries
         X = ee_to_numpy_safe(stack, region=region, scale=scale, crs='EPSG:4326')
         X = np.nan_to_num(np.array(X, dtype=np.float32), nan=0.0)
 
@@ -363,9 +335,7 @@ class GEEProcessor:
         y = np.digitize(yf, qs[1:-1], right=False).astype(np.int32)
         return X, y
 
-# ----------------------------------------------------
-# Models
-# ----------------------------------------------------
+# ---------- Models ----------
 def conv_block(x, f):
     x = layers.Conv2D(f, 3, padding="same", activation="relu")(x)
     x = layers.Conv2D(f, 3, padding="same", activation="relu")(x)
@@ -424,16 +394,12 @@ def build_hybrid_cnn_unet(input_shape, num_classes):
     c2 = conv_block(p1, 64); p2 = layers.MaxPooling2D()(c2)
     c3 = conv_block(p2, 128); p3 = layers.MaxPooling2D()(c3)
     c4 = conv_block(p3, 256); p4 = layers.MaxPooling2D()(c4)
-
     bn = conv_block(p4, 512)
-    bn = aspp(bn, 256)
-    bn = squeeze_excitation(bn, 8)
-
+    bn = aspp(bn, 256); bn = squeeze_excitation(bn, 8)
     u1 = layers.UpSampling2D()(bn); u1 = layers.Concatenate()([u1, c4]); u1 = conv_block(u1, 256)
     u2 = layers.UpSampling2D()(u1); u2 = layers.Concatenate()([u2, c3]); u2 = conv_block(u2, 128)
     u3 = layers.UpSampling2D()(u2); u3 = layers.Concatenate()([u3, c2]); u3 = conv_block(u3, 64)
     u4 = layers.UpSampling2D()(u3); u4 = layers.Concatenate()([u4, c1]); u4 = conv_block(u4, 32)
-
     outputs = layers.Conv2D(num_classes, 1, activation="softmax")(u4)
     return models.Model(inputs, outputs, name="HybridCNNUNet")
 
@@ -445,9 +411,7 @@ def compute_metrics(y_true, y_pred, num_classes):
     f1   = f1_score(yt, yp, average="macro", zero_division=0)
     return acc, prec, rec, f1
 
-# ----------------------------------------------------
-# Sidebar controls
-# ----------------------------------------------------
+# ---------- Sidebar ----------
 with st.sidebar:
     st.header("⚙️ Settings")
     num_classes = st.selectbox("Classes (Poverty_Index quantiles)", [2,3,4,5], index=1)
@@ -458,13 +422,10 @@ with st.sidebar:
     size_km     = st.slider("Patch span around click (km)", 6, 30, 12)
     st.info("Click a district on the map to run the pipeline.")
 
-# ----------------------------------------------------
-# Map & click capture
-# ----------------------------------------------------
+# ---------- Map ----------
 clicked = None
 if HAVE_ST_FOLIUM:
     m = folium.Map(location=[22.9734, 78.6569], zoom_start=5, tiles="CartoDB positron")
-
     adm2 = ee.FeatureCollection("FAO/GAUL_SIMPLIFIED_500m/2015/level2").filter(
         ee.Filter.eq('ADM0_NAME', 'India')
     )
@@ -475,9 +436,7 @@ if HAVE_ST_FOLIUM:
         outline = ee.Image().paint(adm2, 1, 1).visualize(palette=['444444'])
         fill    = ee.Image().paint(adm2, 1).visualize(palette=['000000'], opacity=0.0)
         adm2_vis = ee.ImageCollection([fill, outline]).mosaic()
-
     add_ee_image_to_folium(m, adm2_vis, {}, "Districts (ADM2)")
-
     st_map = st_folium(m, height=600, width=None, returned_objects=["last_clicked"])
     if st_map and st_map.get("last_clicked"):
         clicked = (st_map["last_clicked"]["lat"], st_map["last_clicked"]["lng"])
@@ -491,9 +450,7 @@ else:
     if st.button("Use these coordinates"):
         clicked = (float(lat_in), float(lon_in))
 
-# ----------------------------------------------------
-# Patch creation helpers
-# ----------------------------------------------------
+# ---------- Patching / training helpers ----------
 def make_patches(X, Y, size, stride):
     H, W, C = X.shape
     xs, ys = [], []
@@ -514,16 +471,13 @@ def train_and_eval(model_fn, Xtr, Ytr, Xte, Yte, epochs, batch_size, num_classes
     Yhat = np.argmax(model.predict(Xte, verbose=0), axis=-1)
     return compute_metrics(Yte, Yhat, num_classes), Yhat
 
-# ----------------------------------------------------
-# Pipeline on click
-# ----------------------------------------------------
+# ---------- Pipeline ----------
 if clicked:
     lat, lon = clicked
     processor = GEEProcessor()
     area = processor.set_study_area_from_point(lat, lon)
     if area is None:
         st.error("Click inside India to select a district."); st.stop()
-
     st.success(f"Selected: **{processor.adm2_name}**, {processor.adm1_name}")
 
     with st.spinner("Fetching features from GEE..."):
@@ -531,13 +485,11 @@ if clicked:
         if not ok:
             st.error("Failed to process features from GEE."); st.stop()
 
-        # Extract local patch (robust)
         X_full, y_full = processor.numpy_patch_from_point(
             lat=lat, lon=lon, size_km=size_km, scale=100, num_classes=num_classes
         )
         st.write("**Feature stack shape**:", X_full.shape, " | **Label shape**:", y_full.shape)
 
-        # Normalize continuous channels ~[0,1]
         cont_idx = [0,1,5,6,7,8,9]
         Xn = X_full.copy()
         for k in cont_idx:
@@ -545,21 +497,18 @@ if clicked:
             vmin, vmax = np.percentile(v, 1), np.percentile(v, 99)
             Xn[:,:,k] = 0.0 if vmax<=vmin else np.clip((v - vmin)/(vmax - vmin), 0, 1)
 
-    # Build dataset
     Xp, Yp = make_patches(Xn, y_full, size=patch_size, stride=stride)
     if len(Xp) < 8:
         st.warning("Patch area too small — increase patch span (km) or reduce stride.")
         st.stop()
 
-    # Split
     n = len(Xp); idx = np.random.permutation(n)
     tr_end, te_end = int(0.7*n), int(0.9*n)
     tr_idx, va_idx, te_idx = idx[:tr_end], idx[tr_end:te_end], idx[te_end:]
     Xtr, Ytr = Xp[tr_idx], Yp[tr_idx]
-    Xva, Yva = Xp[va_idx], Yp[va_idx]  # kept for future tuning
+    Xva, Yva = Xp[va_idx], Yp[va_idx]
     Xte, Yte = Xp[te_idx], Yp[te_idx]
 
-    # Train (Hybrid > U-Net > CNN)
     st.subheader("🤖 Training Models")
     col1, col2, col3 = st.columns(3)
     with col1:
@@ -578,7 +527,6 @@ if clicked:
             build_hybrid_cnn_unet, Xtr, Ytr, Xte, Yte, epochs+2, batch_size, num_classes
         )
 
-    # Results
     st.subheader("📊 Metrics")
     df = pd.DataFrame([
         {"Model":"CNN (Baseline)",       "Accuracy":acc_cnn, "Precision":prec_cnn, "Recall":rec_cnn, "F1":f1_cnn},
@@ -586,26 +534,18 @@ if clicked:
         {"Model":"Hybrid CNN+U-Net",     "Accuracy":acc_hyb, "Precision":prec_hyb, "Recall":rec_hyb, "F1":f1_hyb},
     ])
     st.dataframe(df.style.format({c:"{:.4f}" for c in ["Accuracy","Precision","Recall","F1"]}), use_container_width=True)
-
     melted = df.melt(id_vars="Model", var_name="Metric", value_name="Value")
     fig = px.bar(melted, x="Model", y="Value", color="Metric", barmode="group", title="Model Performance")
-    fig.update_layout(height=400)
-    st.plotly_chart(fig, use_container_width=True)
-
+    fig.update_layout(height=400); st.plotly_chart(fig, use_container_width=True)
     best_name = df.loc[df["F1"].idxmax(), "Model"]
     st.success(f"🥇 Best (by F1): **{best_name}**")
 
-    # Download
     csv = df.assign(
         District=processor.adm2_name, State=processor.adm1_name,
         Timestamp=datetime.now().strftime("%Y-%m-%d %H:%M:%S")
     ).to_csv(index=False)
-    st.download_button(
-        "📥 Download metrics CSV",
-        data=csv,
-        file_name=f"metrics_{processor.adm2_name}_{datetime.now().strftime('%Y%m%d_%H%M%S')}.csv",
-        mime="text/csv"
-    )
-
+    st.download_button("📥 Download metrics CSV", data=csv,
+                       file_name=f"metrics_{processor.adm2_name}_{datetime.now().strftime('%Y%m%d_%H%M%S')}.csv",
+                       mime="text/csv")
 else:
     st.info("Click anywhere on the map within India (or enter coordinates if prompted) to select a district.")
