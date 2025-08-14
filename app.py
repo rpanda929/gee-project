@@ -1,20 +1,21 @@
 """
 India District Poverty Mapping — Single-file Streamlit App
-- Auth from secret/env GCP_SA_KEY (raw JSON or base64). No UI auth. No uploads.
-- Click any district in India -> pulls features from GEE -> trains CNN / U-Net / Hybrid -> shows metrics.
+- Auth from secret/env GCP_SA_KEY (raw JSON, base64(JSON), or even TOML inline table).
+- No auth/upload UI.
+- Click any district in India → pulls features from GEE → trains CNN / U-Net / Hybrid → shows metrics.
 
-Set the following in your deployment env (GitHub Actions / Streamlit Cloud / local):
-  - GCP_SA_KEY        := service account JSON (raw) OR base64 of that JSON
+Env/Secrets you need:
+  - GCP_SA_KEY        := full service-account JSON (raw) OR base64 of that JSON (entire file)
   - (optional) GEE_PROJECT_ID
   - (optional) GCP_SA_EMAIL
 
-Packages needed:
-  streamlit, earthengine-api, google-auth, geemap, streamlit-folium,
-  tensorflow, scikit-learn, numpy, pandas, matplotlib, plotly, seaborn, folium
+Packages:
+  streamlit, earthengine-api, google-auth, geemap, streamlit-folium, folium,
+  tensorflow, scikit-learn, numpy, pandas, matplotlib, plotly, seaborn
 """
 import os, json, base64, time
 from datetime import datetime
-from typing import Optional, Dict, Tuple, List
+from typing import Optional, Dict, Tuple
 
 import numpy as np
 import pandas as pd
@@ -23,9 +24,21 @@ import plotly.express as px
 import seaborn as sns
 import matplotlib.pyplot as plt
 
-from streamlit_folium import st_folium
-import folium
+# --- safe import for streamlit-folium (graceful fallback if missing) ---
+HAVE_ST_FOLIUM = True
+try:
+    from streamlit_folium import st_folium
+except Exception:
+    HAVE_ST_FOLIUM = False
+    try:
+        import sys, subprocess
+        subprocess.check_call([sys.executable, "-m", "pip", "install", "streamlit-folium"])
+        from streamlit_folium import st_folium
+        HAVE_ST_FOLIUM = True
+    except Exception:
+        pass
 
+import folium
 import ee
 import geemap
 
@@ -47,33 +60,64 @@ st.title("🗺️ India District Poverty Mapping — GEE + CNN / U-Net / Hybrid"
 st.caption("Click any district in India to fetch features from GEE and train three models on a local patch.")
 
 # ---------------------------
-# Earth Engine auth via env/secret (no UI)
+# Robust Earth Engine auth via env/secret (no UI)
 # ---------------------------
 def _read_sa_json_from_secret(var="GCP_SA_KEY") -> dict:
+    """Return SA JSON as dict from Streamlit secrets or env.
+    Accepts: dict (TOML inline table), raw JSON string, base64(JSON), or string with escaped newlines.
+    Raises RuntimeError with clear message if invalid/missing.
+    """
+    raw = None
+    # Prefer Streamlit secrets if available
     try:
-        raw = st.secrets.get(var, "")
-        if not raw:
-            raw = os.environ.get(var, "")
+        raw = st.secrets.get(var, None)
     except Exception:
-        raw = os.environ.get(var, "")
-    if not raw:
-        st.error("Missing service account key. Set GCP_SA_KEY (raw JSON or base64).")
-        st.stop()
+        pass
+    if raw is None:
+        raw = os.environ.get(var, None)
 
-    s = raw.strip()
-    if s.startswith("{"):
-        return json.loads(s)
-    # try base64
-    try:
-        decoded = base64.b64decode(s).decode("utf-8")
-        return json.loads(decoded)
-    except Exception:
-        # maybe still JSON string
+    if raw in (None, ""):
+        raise RuntimeError("Missing service account key. Set GCP_SA_KEY (raw JSON or base64 of the entire key.json).")
+
+    # If user accidentally stored as TOML inline table, Streamlit gives us a dict already
+    if isinstance(raw, dict):
+        return raw
+
+    # Bytes → str
+    if isinstance(raw, bytes):
+        raw = raw.decode("utf-8", errors="ignore")
+
+    s = str(raw).strip()
+
+    # Raw JSON
+    if s.startswith("{") and s.endswith("}"):
         try:
             return json.loads(s)
-        except Exception:
-            st.error("GCP_SA_KEY is neither JSON nor valid base64 JSON.")
-            st.stop()
+        except json.JSONDecodeError:
+            # Try un-escaping newlines (common when pasting into TOML)
+            try:
+                return json.loads(s.replace("\\n", "\n"))
+            except Exception as e:
+                raise RuntimeError(f"GCP_SA_KEY looks like JSON but failed to parse: {e}") from e
+
+    # Base64 → JSON
+    try:
+        decoded = base64.b64decode(s, validate=False).decode("utf-8", errors="ignore").strip()
+        if decoded.startswith("{") and decoded.endswith("}"):
+            return json.loads(decoded)
+    except Exception:
+        pass
+
+    # Last attempt: treat string with escaped newlines as JSON
+    try:
+        return json.loads(s.replace("\\n", "\n"))
+    except Exception:
+        pass
+
+    raise RuntimeError(
+        "GCP_SA_KEY is not valid JSON or base64(JSON).\n"
+        "Store the FULL service-account key.json either triple-quoted in Streamlit secrets or as a clean base64 string."
+    )
 
 def ee_init_from_secret():
     key_info = _read_sa_json_from_secret()
@@ -82,7 +126,13 @@ def ee_init_from_secret():
         "https://www.googleapis.com/auth/earthengine",
         "https://www.googleapis.com/auth/devstorage.full_control",
     ]
-    creds = service_account.Credentials.from_service_account_info(key_info, scopes=scopes)
+    try:
+        creds = service_account.Credentials.from_service_account_info(key_info, scopes=scopes)
+    except Exception as e:
+        raise RuntimeError(
+            "Could not build credentials from GCP_SA_KEY. "
+            "Make sure you supplied the FULL service-account JSON (not just the private_key)."
+        ) from e
     project = os.environ.get("GEE_PROJECT_ID", "weighty-time-440511-h3")
     ee.Initialize(credentials=creds, project=project)
 
@@ -90,10 +140,14 @@ def ee_init_from_secret():
 try:
     ee.Number(1).getInfo()
 except Exception:
-    ee_init_from_secret()
+    try:
+        ee_init_from_secret()
+    except Exception as e:
+        st.error(str(e))
+        st.stop()
 
 # ----------------------------------------------------
-# GEE Processor (inline, no separate file)
+# GEE Processor (inline)
 # ----------------------------------------------------
 class GEEProcessor:
     """Handles Google Earth Engine data processing for poverty mapping (India-wide)."""
@@ -304,8 +358,7 @@ def aspp(x, filters=256):
     d1 = layers.Conv2D(filters, 1, padding="same", activation="relu")(x)
     d2 = layers.Conv2D(filters, 3, dilation_rate=2, padding="same", activation="relu")(x)
     d3 = layers.Conv2D(filters, 3, dilation_rate=4, padding="same", activation="relu")(x)
-    # global pooling branch
-    h, w = tf.shape(x)[1], tf.shape(x)[2]
+    # global pooling branch (relies on static shapes from fixed patch size)
     d4 = layers.AveragePooling2D(pool_size=(x.shape[1], x.shape[2]))(x)
     d4 = layers.Conv2D(filters, 1, padding="same", activation="relu")(d4)
     d4 = layers.UpSampling2D(size=(x.shape[1], x.shape[2]))(d4)
@@ -364,15 +417,28 @@ with st.sidebar:
     st.info("Click a district on the map to run the pipeline.")
 
 # ----------------------------------------------------
-# Map (India ADM2 boundaries) + click capture
+# Map (India ADM2 boundaries) + click capture OR manual fallback
 # ----------------------------------------------------
-m = folium.Map(location=[22.9734, 78.6569], zoom_start=5, tiles="CartoDB positron")
-adm2 = ee.FeatureCollection("FAO/GAUL_SIMPLIFIED_500m/2015/level2").filter(ee.Filter.eq('ADM0_NAME', 'India'))
-style = {'color': '#444444', 'weight': 1, 'fillColor': '#00000000'}
-adm2_vis = adm2.style(**style)
-tile = geemap.ee_tile_layer(adm2_vis, {}, "Districts (ADM2)")
-tile.add_to(m)
-st_map = st_folium(m, height=600, width=None, returned_objects=["last_clicked"])
+clicked = None
+if HAVE_ST_FOLIUM:
+    m = folium.Map(location=[22.9734, 78.6569], zoom_start=5, tiles="CartoDB positron")
+    adm2 = ee.FeatureCollection("FAO/GAUL_SIMPLIFIED_500m/2015/level2").filter(ee.Filter.eq('ADM0_NAME', 'India'))
+    style = {'color': '#444444', 'weight': 1, 'fillColor': '#00000000'}
+    adm2_vis = adm2.style(**style)
+    tile = geemap.ee_tile_layer(adm2_vis, {}, "Districts (ADM2)")
+    tile.add_to(m)
+    st_map = st_folium(m, height=600, width=None, returned_objects=["last_clicked"])
+    if st_map and st_map.get("last_clicked"):
+        clicked = (st_map["last_clicked"]["lat"], st_map["last_clicked"]["lng"])
+else:
+    st.warning("`streamlit-folium` is not installed; using manual coordinate input.")
+    c1, c2 = st.columns(2)
+    with c1:
+        lat_in = st.number_input("Latitude", value=20.2961, format="%.6f")
+    with c2:
+        lon_in = st.number_input("Longitude", value=85.8245, format="%.6f")
+    if st.button("Use these coordinates"):
+        clicked = (float(lat_in), float(lon_in))
 
 # ----------------------------------------------------
 # Helper: make sliding-window patches
@@ -400,8 +466,8 @@ def train_and_eval(model_fn, Xtr, Ytr, Xte, Yte, epochs, batch_size, num_classes
 # ----------------------------------------------------
 # On click → run full pipeline
 # ----------------------------------------------------
-if st_map and st_map.get("last_clicked"):
-    lat = st_map["last_clicked"]["lat"]; lon = st_map["last_clicked"]["lng"]
+if clicked:
+    lat, lon = clicked
     processor = GEEProcessor()
     area = processor.set_study_area_from_point(lat, lon)
     if area is None:
@@ -495,4 +561,4 @@ if st_map and st_map.get("last_clicked"):
     )
 
 else:
-    st.info("Click anywhere on the map within India to select a district.")
+    st.info("Click anywhere on the map within India (or enter coordinates if prompted) to select a district.")
