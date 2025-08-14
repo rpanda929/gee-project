@@ -9,7 +9,7 @@ Env / Secrets required:
 
 import os, json, base64, re
 from datetime import datetime
-from typing import Optional, Dict, Tuple
+from typing import Optional, Dict, Tuple, List
 
 import numpy as np
 import pandas as pd
@@ -107,19 +107,18 @@ def ee_init_from_secret():
     ]
     creds = service_account.Credentials.from_service_account_info(key_info, scopes=scopes)
 
-    # Strict: DO NOT fallback without a project. That causes later compute errors.
+    # Strict project init (no fallback)
     try:
         ee.Initialize(credentials=creds, project=project)
-        # sanity compute to ensure the project actually works
         _ = ee.Image(1).reduceRegion(ee.Reducer.mean(), ee.Geometry.Point([0,0]).buffer(10000), 1000).getInfo()
     except Exception as e:
         st.error(
             f"Earth Engine failed to initialize with project '{project}'.\n\n"
-            "Fix this in your Google Cloud/Earth Engine setup:\n"
-            "• Enable the Earth Engine API on the project\n"
-            "• Earth Engine Code Editor → Settings → Cloud Projects → USE this project\n"
-            "• IAM: grant your Service Account at least 'Editor' (or EE roles) on the project\n"
-            "• Earth Engine Settings → Service Accounts: add your SA email\n\n"
+            "Fix in Google Cloud/Earth Engine:\n"
+            "• Enable EE API on the project\n"
+            "• EE Code Editor → Settings → Cloud Projects → USE this project\n"
+            "• IAM: grant your Service Account (this key) at least 'Editor' (or EE roles)\n"
+            "• EE Settings → Service Accounts: add your SA email\n\n"
             f"Original error:\n{e}"
         )
         st.stop()
@@ -140,37 +139,36 @@ def add_ee_image_to_folium(m: folium.Map, ee_image: ee.Image, vis_params: dict, 
         control=True,
     ).add_to(m)
 
-def ee_to_numpy_safe(image: ee.Image, region: ee.Geometry, scale: int, crs: str = 'EPSG:4326') -> np.ndarray:
-    """Try geemap.ee_to_numpy (scale, 2x, 4x). If that fails, use sampleRectangle
-       WITHOUT calling bandNames().getInfo() (avoids default-project discovery)."""
+# --- NEW: ultra-robust exporter ---
+def ee_to_numpy_robust(image: ee.Image, region: ee.Geometry, base_scale: int, crs: str) -> np.ndarray:
+    """
+    1) Try geemap.ee_to_numpy at (scale, 2x, 4x)
+    2) If that fails, do band-wise sampleRectangle after a common reproject.
+    """
     last_err = None
     for mul in [1, 2, 4]:
         try:
-            return geemap.ee_to_numpy(image, region=region, scale=int(scale*mul), crs=crs)
+            return geemap.ee_to_numpy(image, region=region, scale=int(base_scale*mul), crs=crs)
         except Exception as e:
             last_err = e
-    # Fallback – one server call, no bandNames().getInfo()
+
+    # Fallback: band-wise sampleRectangle (more tolerant)
     try:
-        # Use coarser scale inside the image and sample rectangle
-        img_rp = image.reproject(crs=crs, scale=int(scale*4))
-        data = img_rp.sampleRectangle(region=region, defaultValue=0).getInfo()
-        # data is {bandName: 2D list, ...} — keys are the band names.
-        bands = [k for k, v in data.items() if isinstance(v, list)]
-        # If order matters, try to preserve image order silently (but do not fail if it can’t be fetched)
-        try:
-            ordered = image.bandNames().getInfo()
-            bands = [b for b in ordered if b in data]
-        except Exception:
-            pass
-        arr0 = np.array(data[bands[0]], dtype=np.float32)
-        h, w = arr0.shape
-        out = np.zeros((h, w, len(bands)), dtype=np.float32)
-        out[:, :, 0] = arr0
-        for i, b in enumerate(bands[1:], start=1):
-            out[:, :, i] = np.array(data[b], dtype=np.float32)
+        bands: List[str] = image.bandNames().getInfo()
+        out = None
+        for i, b in enumerate(bands):
+            band_img = image.select([b]).reproject(crs=crs, scale=int(base_scale*4))
+            data = band_img.sampleRectangle(region=region, defaultValue=0).getInfo()
+            arr2d = np.array(data[b], dtype=np.float32)
+            if out is None:
+                h, w = arr2d.shape
+                out = np.zeros((h, w, len(bands)), dtype=np.float32)
+            out[:, :, i] = arr2d
+        if out is None:
+            raise RuntimeError("Empty sampleRectangle response.")
         return out
-    except Exception as e:
-        raise RuntimeError(f"Failed to convert EE image to numpy. Last error: {last_err}\nFallback error: {e}")
+    except Exception as e2:
+        raise RuntimeError(f"Failed to convert EE image to numpy. Last error: {last_err}\nFallback error: {e2}")
 
 # ---------- GEE Processor ----------
 class GEEProcessor:
@@ -243,7 +241,6 @@ class GEEProcessor:
             return None
 
     def get_viirs_annual(self, year=2020) -> Optional[ee.Image]:
-        """VIIRS VNL v21 band is 'avg_rad'."""
         try:
             ntl = ee.ImageCollection('NOAA/VIIRS/DNB/ANNUAL_V21') \
                 .filterDate(f'{year}-01-01', f'{year}-12-31').first() \
@@ -317,23 +314,35 @@ class GEEProcessor:
     def numpy_patch_from_point(
         self, lat: float, lon: float, size_km: float = 12, scale: int = 100, num_classes: int = 3
     ) -> Tuple[np.ndarray, np.ndarray]:
+        """
+        Build region, then try (scale, 2×, 4×) and (size_km, 0.75×, 0.5×) combinations.
+        """
         pt = ee.Geometry.Point([lon, lat])
-        region = pt.buffer(size_km * 1000 / 2.0).bounds().intersection(self.study_area, maxError=1)
 
         stack = self.get_feature_stack()
         if stack is None:
             raise RuntimeError("Feature stack not ready")
 
-        X = ee_to_numpy_safe(stack, region=region, scale=scale, crs='EPSG:4326')
-        X = np.nan_to_num(np.array(X, dtype=np.float32), nan=0.0)
+        # try shrinking region if needed
+        for km_factor in [1.0, 0.75, 0.5]:
+            size_try = size_km * km_factor
+            region = pt.buffer(size_try * 1000 / 2.0).bounds().intersection(self.study_area, maxError=1)
+            # robust export
+            try:
+                X = ee_to_numpy_robust(stack, region=region, base_scale=scale, crs='EPSG:4326')
+                X = np.nan_to_num(np.array(X, dtype=np.float32), nan=0.0)
+                pov = ee_to_numpy_robust(self.features['Poverty_Index'], region=region, base_scale=scale, crs='EPSG:4326')
+                yf = np.nan_to_num(np.array(pov, dtype=np.float32), nan=0.0).squeeze()
 
-        pov = ee_to_numpy_safe(self.features['Poverty_Index'], region=region, scale=scale, crs='EPSG:4326')
-        yf = np.nan_to_num(np.array(pov, dtype=np.float32), nan=0.0).squeeze()
+                flat = yf.flatten()
+                qs = np.quantile(flat[~np.isnan(flat)], np.linspace(0, 1, num_classes + 1))
+                y = np.digitize(yf, qs[1:-1], right=False).astype(np.int32)
+                return X, y
+            except Exception as e:
+                last_error = e
+                continue
 
-        flat = yf.flatten()
-        qs = np.quantile(flat[~np.isnan(flat)], np.linspace(0, 1, num_classes + 1))
-        y = np.digitize(yf, qs[1:-1], right=False).astype(np.int32)
-        return X, y
+        raise RuntimeError(f"Patch export failed even after retries: {last_error}")
 
 # ---------- Models ----------
 def conv_block(x, f):
@@ -485,11 +494,13 @@ if clicked:
         if not ok:
             st.error("Failed to process features from GEE."); st.stop()
 
+        # --- robust patch export (now with retries over region size) ---
         X_full, y_full = processor.numpy_patch_from_point(
             lat=lat, lon=lon, size_km=size_km, scale=100, num_classes=num_classes
         )
         st.write("**Feature stack shape**:", X_full.shape, " | **Label shape**:", y_full.shape)
 
+        # Normalize continuous channels ~[0,1]
         cont_idx = [0,1,5,6,7,8,9]
         Xn = X_full.copy()
         for k in cont_idx:
